@@ -72,7 +72,8 @@ class Lake:
     def tables(self) -> list[str]:
         rows = self.con.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_catalog = ? ORDER BY table_name",
+            "WHERE table_catalog = ? AND table_name NOT LIKE '\\_mdb\\_%' ESCAPE '\\' "
+            "ORDER BY table_name",
             [self.alias],
         ).fetchall()
         return [r[0] for r in rows]
@@ -286,12 +287,47 @@ def load_full(lake: Lake, table: str, csv_path: str | Path) -> None:
         con.execute(f"CREATE TABLE {qualified} AS {untyped}", [str(csv_path)])
 
 
+STATE_TABLE = "_mdb_sync_state"
+
+
+def _ensure_state_table(lake: Lake) -> None:
+    lake.con.execute(
+        f"CREATE TABLE IF NOT EXISTS {lake.alias}.{STATE_TABLE} "
+        "(table_name VARCHAR, source_sha256 VARCHAR, loaded_rows BIGINT)"
+    )
+
+
+def _load_state(lake: Lake) -> dict[str, tuple[str, int]]:
+    rows = lake.con.execute(
+        f"SELECT table_name, source_sha256, loaded_rows FROM {lake.alias}.{STATE_TABLE}"
+    ).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def _record_state(lake: Lake, table: str, digest: str, loaded_rows: int) -> None:
+    q = f"{lake.alias}.{STATE_TABLE}"
+    lake.con.execute(f"DELETE FROM {q} WHERE table_name = ?", [table])
+    lake.con.execute(f"INSERT INTO {q} VALUES (?, ?, ?)", [table, digest, loaded_rows])
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 @dataclass
 class TableResult:
     table: str
     source_rows: int
     loaded_rows: int
     ok: bool
+    # "new" | "changed" | "unchanged" | "error"
+    status: str = "changed"
     error: Optional[str] = None
 
 
@@ -302,16 +338,20 @@ def sync_access_database(
     include: Optional[Iterable[str]] = None,
     delete_missing: bool = True,
     full: bool = True,
+    incremental: bool = True,
 ) -> list[TableResult]:
-    """Copy every table of an .accdb into the lake, verifying row counts.
+    """Copy every table of an .accdb into the lake.
 
-    With ``full=True`` (default) each table is fully replaced — the right mode
-    for an initial complete copy and for tables with no known primary key. With
-    ``full=False`` a table is MERGE-mirrored when a primary key is given in
-    ``pks``, else it falls back to full replace.
+    Each table is exported and fingerprinted (sha256 of the export). With
+    ``incremental=True`` (default), a table whose fingerprint matches the last
+    sync is **skipped** — no load, no parquet write, no S3 upload — which is
+    where the cost is. Changed/new tables are loaded: fully replaced
+    (``full=True`` or no pk known) or MERGE-mirrored when a primary key is
+    given in ``pks`` and ``full=False``.
 
-    Returns a :class:`TableResult` per table so callers can spot row-count
-    mismatches (e.g. CSV parsing dropping rows).
+    Returns a :class:`TableResult` per table (status: new/changed/unchanged/
+    error). ``source_rows`` comes from ``mdb-count``, an unreliable oracle on
+    ACE files — treat count mismatches as "review", not proof of data loss.
     """
     from mdb_ducklake import access
 
@@ -320,6 +360,9 @@ def sync_access_database(
     include_set = set(include) if include is not None else None
     results: list[TableResult] = []
 
+    _ensure_state_table(lake)
+    prior = _load_state(lake)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         for name in access.list_tables(access_file):
             if include_set is not None and name not in include_set:
@@ -327,19 +370,30 @@ def sync_access_database(
             try:
                 csv_path = Path(tmpdir) / "t.csv"
                 access.export_csv(access_file, name, csv_path)
+                digest = _sha256(csv_path)
+
+                if incremental and name in prior and prior[name][0] == digest:
+                    results.append(
+                        TableResult(name, prior[name][1], prior[name][1], ok=True, status="unchanged")
+                    )
+                    continue
+
+                status = "changed" if name in prior else "new"
                 if full or name not in pks:
                     load_full(lake, name, csv_path)
                 else:
                     sync_csv(lake, name, csv_path, pks[name], delete_missing=delete_missing)
+
                 source_rows = access.count(access_file, name)
                 loaded_rows = lake.con.execute(
                     f"SELECT count(*) FROM {lake.alias}.{_quote(name)}"
                 ).fetchone()[0]
+                _record_state(lake, name, digest, loaded_rows)
                 results.append(
-                    TableResult(name, source_rows, loaded_rows, ok=(source_rows == loaded_rows))
+                    TableResult(name, source_rows, loaded_rows, ok=(source_rows == loaded_rows), status=status)
                 )
             except Exception as exc:  # keep going; report per-table
-                results.append(TableResult(name, -1, -1, ok=False, error=f"{type(exc).__name__}: {exc}"))
+                results.append(TableResult(name, -1, -1, ok=False, status="error", error=f"{type(exc).__name__}: {exc}"))
     return results
 
 

@@ -41,8 +41,15 @@ uv run mdb-ducklake --catalog local.ducklake --data-path data \
   sync path/to/db.accdb
 ```
 
-By default every table is **fully replaced** (a complete copy; no primary keys
-needed). For incremental upserts on a subset, add `--merge --pks '{"Suco":"Suco_ID"}'`.
+Syncs are **incremental by default**: each table is exported and fingerprinted
+(sha256), and a table whose fingerprint matches the last sync is skipped — no
+load, no parquet write, no S3 upload (fingerprints are kept in a hidden
+`_mdb_sync_state` table in the lake). Changed/new tables are fully replaced (no
+primary keys needed). Flags:
+
+- `--full-refresh` — reload every table even if unchanged.
+- `--merge --pks '{"Suco":"Suco_ID"}'` — row-level MERGE (only changed rows
+  rewritten) for the listed tables, instead of full replace.
 
 ### S3 DATA_PATH (DigitalOcean Spaces)
 
