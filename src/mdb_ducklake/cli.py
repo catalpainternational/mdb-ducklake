@@ -67,6 +67,13 @@ def main(argv: list[str] | None = None) -> int:
         for r in review:
             delta = r.loaded_rows - r.source_rows
             print(f"  REVIEW {r.table}: mdb-count={r.source_rows} loaded={r.loaded_rows} ({delta:+d})")
+        typed_bad = [r for r in (new + changed) if r.reject_count]
+        total_rejects = sum(r.reject_count for r in typed_bad)
+        if total_rejects:
+            print(f"{total_rejects} cell(s) couldn't be typed (kept verbatim in _mdb_cast_rejects):")
+            for r in typed_bad:
+                cols = ", ".join(f"{c}={n}" for c, n in sorted(r.rejects.items()))
+                print(f"  TYPED  {r.table}: {cols}")
         for r in errored:
             print(f"  ERROR  {r.table}: {r.error}")
         _finish(lake, wrote=wrote)

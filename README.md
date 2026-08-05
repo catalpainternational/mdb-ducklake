@@ -81,6 +81,25 @@ catalog also in the bucket; local and S3 `DATA_PATH`; full-replace and MERGE
 loads; snapshots + time-travel; SOPS-encrypted creds via `sops exec-env`;
 cold readers reconstruct the mirror from S3 alone.
 
+## Typing (lossless)
+
+Columns are typed from the Access schema (`mdb-schema`), not guessed from the
+CSV: `Long Integer`→`BIGINT`, `DateTime`→`TIMESTAMP`, `Currency`→`DECIMAL(19,4)`,
+`Boolean`→`BOOLEAN`, `Text`/`Memo`→`VARCHAR`, etc. Each table is loaded as raw
+text and then `TRY_CAST` into the typed schema, so:
+
+- every row is kept (a bad value never drops a row);
+- a *successful* cast is lossless (reversible), so the only information typing
+  can't hold is a cell that fails to cast — and each of those is preserved
+  verbatim in the hidden **`_mdb_cast_rejects`** table
+  `(table_name, row_ordinal, column_name, access_type, raw_value)`, and counted
+  in the sync report.
+
+On PNDS this leaves exactly 10 rejects, all Access's invalid `1900-01-00` zero
+date — typed cell becomes NULL, original kept in the sidecar. No polars/pydantic
+dependency; typing is pure DuckDB. Re-typing an existing mirror after a loader
+change needs one `--full-refresh` (unchanged sources are otherwise skipped).
+
 ## Completeness
 
 `mdb-count` is an unreliable oracle on Access-2007+ (`ACE12`) files, so the

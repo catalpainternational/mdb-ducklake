@@ -268,23 +268,140 @@ def sync_csv(
     merge_staging(lake, table, pk, delete_missing=delete_missing)
 
 
-def load_full(lake: Lake, table: str, csv_path: str | Path) -> None:
-    """Replace ``lake.<table>`` entirely with the contents of a CSV file.
+# Access type token -> DuckDB storage type. Unknown/absent -> VARCHAR (kept as
+# text, never a cast failure). A *successful* TRY_CAST is lossless, so only
+# failed casts can lose information — those are captured in REJECTS_TABLE.
+ACCESS_TO_DUCKDB = {
+    "Long Integer": "BIGINT",
+    "Integer": "INTEGER",
+    "Byte": "UTINYINT",
+    "Single": "FLOAT",
+    "Double": "DOUBLE",
+    "Currency": "DECIMAL(19,4)",
+    "Decimal": "DECIMAL(19,4)",
+    "DateTime": "TIMESTAMP",
+    "Boolean": "BOOLEAN",
+    "Text": "VARCHAR",
+    "Memo": "VARCHAR",
+    "Memo/Hyperlink": "VARCHAR",
+    "GUID": "VARCHAR",
+    "OLE": "VARCHAR",
+}
 
-    No primary key required — used for the initial bulk copy and for tables
-    with no known key. Types are inferred from the whole file; if inference
-    fails (mixed/awkward columns) it falls back to all-VARCHAR so the copy is
-    never lost to a parse error.
+REJECTS_TABLE = "_mdb_cast_rejects"
+
+
+def _duckdb_type(access_type: str) -> str:
+    return ACCESS_TO_DUCKDB.get(access_type, "VARCHAR")
+
+
+def _cast_sql(col_quoted: str, duck_type: str) -> str:
+    if duck_type == "BOOLEAN":
+        # mdb-export emits 0/1 (Access true is -1); anything non-zero is true.
+        return f"(TRY_CAST({col_quoted} AS INTEGER) <> 0)"
+    return f"TRY_CAST({col_quoted} AS {duck_type})"
+
+
+def _ensure_rejects_table(lake: Lake) -> None:
+    lake.con.execute(
+        f"CREATE TABLE IF NOT EXISTS {lake.alias}.{REJECTS_TABLE} "
+        "(table_name VARCHAR, row_ordinal BIGINT, column_name VARCHAR, "
+        "access_type VARCHAR, raw_value VARCHAR)"
+    )
+
+
+def load_full(
+    lake: Lake,
+    table: str,
+    csv_path: str | Path,
+    column_types: Optional[Sequence[tuple[str, str]]] = None,
+) -> dict[str, int]:
+    """Replace ``lake.<table>`` entirely with the CSV contents.
+
+    With ``column_types`` (from :func:`access.column_types`), columns are typed
+    via ``TRY_CAST`` off an all-VARCHAR raw load: every row is kept, and any
+    cell that can't be typed becomes NULL but is preserved verbatim in
+    ``_mdb_cast_rejects`` (table, row ordinal, column, raw value). Without
+    ``column_types``, falls back to CSV type inference.
+
+    Returns ``{column: failed_cast_count}`` for the report.
     """
     con = lake.con
     qualified = f"{lake.alias}.{_quote(table)}"
+
+    if not column_types:
+        con.execute(f"DROP TABLE IF EXISTS {qualified}")
+        typed = "SELECT * FROM read_csv(?, header=true, sample_size=-1)"
+        untyped = "SELECT * FROM read_csv(?, header=true, all_varchar=true)"
+        try:
+            con.execute(f"CREATE TABLE {qualified} AS {typed}", [str(csv_path)])
+        except duckdb.Error:
+            con.execute(f"CREATE TABLE {qualified} AS {untyped}", [str(csv_path)])
+        return {}
+
+    # Raw all-VARCHAR load with a synthetic ordinal to locate any rejects.
+    con.execute("DROP TABLE IF EXISTS _mdb_raw")
+    con.execute(
+        "CREATE TEMP TABLE _mdb_raw AS "
+        "SELECT *, row_number() OVER () AS _mdb_rn "
+        "FROM read_csv(?, header=true, all_varchar=true)",
+        [str(csv_path)],
+    )
+    raw_cols = [c for c in _describe(con, "_mdb_raw") if c != "_mdb_rn"]
+    typemap = {name: (_duckdb_type(t), t) for name, t in column_types}
+
+    select_parts: list[str] = []
+    typed_cols: list[tuple[str, str, str]] = []  # (col, duck_type, access_type)
+    for c in raw_cols:
+        cq = _quote(c)
+        duck_type, access_type = typemap.get(c, ("VARCHAR", "Text"))
+        if duck_type == "VARCHAR":
+            select_parts.append(cq)  # keep raw text; never a reject
+        else:
+            select_parts.append(f"{_cast_sql(cq, duck_type)} AS {cq}")
+            typed_cols.append((c, duck_type, access_type))
+
     con.execute(f"DROP TABLE IF EXISTS {qualified}")
-    typed = "SELECT * FROM read_csv(?, header=true, sample_size=-1)"
-    untyped = "SELECT * FROM read_csv(?, header=true, all_varchar=true)"
-    try:
-        con.execute(f"CREATE TABLE {qualified} AS {typed}", [str(csv_path)])
-    except duckdb.Error:
-        con.execute(f"CREATE TABLE {qualified} AS {untyped}", [str(csv_path)])
+    con.execute(f"CREATE TABLE {qualified} AS SELECT {', '.join(select_parts)} FROM _mdb_raw")
+
+    return _capture_rejects(lake, table, typed_cols)
+
+
+def _capture_rejects(
+    lake: Lake, table: str, typed_cols: Sequence[tuple[str, str, str]]
+) -> dict[str, int]:
+    """Record cells that failed to type (raw non-empty but TRY_CAST -> NULL)."""
+    con = lake.con
+    _ensure_rejects_table(lake)
+    rq = f"{lake.alias}.{_quote(REJECTS_TABLE)}"
+
+    # Clear this table's prior rejects only if it had any (avoid empty snapshots).
+    had = con.execute(f"SELECT count(*) FROM {rq} WHERE table_name = ?", [table]).fetchone()[0]
+    if had:
+        con.execute(f"DELETE FROM {rq} WHERE table_name = ?", [table])
+    if not typed_cols:
+        return {}
+
+    # Gather into a temp table (cheap, no snapshots), then one insert into the lake.
+    con.execute("DROP TABLE IF EXISTS _mdb_rej")
+    con.execute(
+        "CREATE TEMP TABLE _mdb_rej "
+        "(table_name VARCHAR, row_ordinal BIGINT, column_name VARCHAR, "
+        "access_type VARCHAR, raw_value VARCHAR)"
+    )
+    for col, duck_type, access_type in typed_cols:
+        cq = _quote(col)
+        con.execute(
+            f"INSERT INTO _mdb_rej SELECT ?, _mdb_rn, ?, ?, {cq} FROM _mdb_raw "
+            f"WHERE {cq} IS NOT NULL AND {cq} <> '' AND ({_cast_sql(cq, duck_type)}) IS NULL",
+            [table, col, access_type],
+        )
+    counts = dict(
+        con.execute("SELECT column_name, count(*) FROM _mdb_rej GROUP BY column_name").fetchall()
+    )
+    if counts:
+        con.execute(f"INSERT INTO {rq} SELECT * FROM _mdb_rej")
+    return counts
 
 
 STATE_TABLE = "_mdb_sync_state"
@@ -329,6 +446,12 @@ class TableResult:
     # "new" | "changed" | "unchanged" | "error"
     status: str = "changed"
     error: Optional[str] = None
+    # {column: count} of cells that failed to type (preserved in _mdb_cast_rejects)
+    rejects: Optional[dict[str, int]] = None
+
+    @property
+    def reject_count(self) -> int:
+        return sum(self.rejects.values()) if self.rejects else 0
 
 
 def sync_access_database(
@@ -379,8 +502,9 @@ def sync_access_database(
                     continue
 
                 status = "changed" if name in prior else "new"
+                rejects: dict[str, int] = {}
                 if full or name not in pks:
-                    load_full(lake, name, csv_path)
+                    rejects = load_full(lake, name, csv_path, column_types=access.column_types(access_file, name))
                 else:
                     sync_csv(lake, name, csv_path, pks[name], delete_missing=delete_missing)
 
@@ -390,7 +514,10 @@ def sync_access_database(
                 ).fetchone()[0]
                 _record_state(lake, name, digest, loaded_rows)
                 results.append(
-                    TableResult(name, source_rows, loaded_rows, ok=(source_rows == loaded_rows), status=status)
+                    TableResult(
+                        name, source_rows, loaded_rows, ok=(source_rows == loaded_rows),
+                        status=status, rejects=rejects or None,
+                    )
                 )
             except Exception as exc:  # keep going; report per-table
                 results.append(TableResult(name, -1, -1, ok=False, status="error", error=f"{type(exc).__name__}: {exc}"))

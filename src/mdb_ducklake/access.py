@@ -8,6 +8,7 @@ No Python dependency, so this repo stays off mdb-codegen's pydantic-v1 stack.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -48,6 +49,26 @@ def count(access_file: str | Path, table: str) -> int:
 
 def schema(access_file: str | Path, table: str) -> str:
     return _run(["mdb-schema", "-T", table, str(access_file)]).decode(errors="replace")
+
+
+# A column line in mdb-schema DDL, e.g. "\t[Report_Month]\t\t\tDateTime, "
+# The CREATE TABLE line doesn't start with "[", so it won't match.
+_COL_RE = re.compile(r"^\s*\[(?P<name>.+?)\]\s+(?P<type>[A-Za-z][A-Za-z /]*)")
+
+
+def column_types(access_file: str | Path, table: str) -> list[tuple[str, str]]:
+    """Parse mdb-schema DDL into ``[(column_name, access_type), ...]``.
+
+    ``access_type`` is the raw Access type token, e.g. "Long Integer",
+    "DateTime", "Currency", "Text" (the "(255)" length is dropped). Callers map
+    it to a storage type.
+    """
+    cols: list[tuple[str, str]] = []
+    for line in schema(access_file, table).splitlines():
+        m = _COL_RE.match(line)
+        if m:
+            cols.append((m.group("name"), m.group("type").strip()))
+    return cols
 
 
 def export_csv(access_file: str | Path, table: str, dest: str | Path) -> Path:
