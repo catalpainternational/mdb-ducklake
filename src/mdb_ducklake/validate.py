@@ -95,6 +95,7 @@ def main(argv=None) -> int:
     ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
     ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
     ap.add_argument("--include", nargs="*")
+    ap.add_argument("--json", action="store_true", help="emit a structured JSON reconcile report")
     args = ap.parse_args(argv)
 
     mapping = json.load(open(args.mapping))
@@ -121,18 +122,34 @@ def main(argv=None) -> int:
     secs = time.time() - t0
 
     dirty = [d for d in diffs if not d.clean]
-    print(
-        f"Validated {len(diffs)} tables vs schema '{args.pg_schema}' in {secs:.1f}s: "
-        f"{len(diffs) - len(dirty)} clean, {len(dirty)} with differences, {len(skipped)} skipped."
-    )
-    for d in dirty:
-        chg = "" if d.changed is None else f" changed={d.changed}"
+    if args.json:
+        print(json.dumps({
+            "command": "validate",
+            "schema": args.pg_schema,
+            "secs": round(secs, 1),
+            "deep": args.deep,
+            "tables_checked": len(diffs),
+            "clean": len(diffs) - len(dirty),
+            "differences": [
+                {"table": d.table, "mirror_rows": d.mirror_rows, "pg_rows": d.pg_rows,
+                 "only_in_mirror": d.only_in_mirror, "only_in_pg": d.only_in_pg, "changed": d.changed}
+                for d in dirty
+            ],
+            "skipped": skipped,
+        }))
+    else:
         print(
-            f"  DIFF {d.table}: mirror={d.mirror_rows} pg={d.pg_rows} "
-            f"only_in_mirror={d.only_in_mirror} only_in_pg={d.only_in_pg}{chg}"
+            f"Validated {len(diffs)} tables vs schema '{args.pg_schema}' in {secs:.1f}s: "
+            f"{len(diffs) - len(dirty)} clean, {len(dirty)} with differences, {len(skipped)} skipped."
         )
-    for t in skipped:
-        print(f"  SKIP {t}: not in mirror")
+        for d in dirty:
+            chg = "" if d.changed is None else f" changed={d.changed}"
+            print(
+                f"  DIFF {d.table}: mirror={d.mirror_rows} pg={d.pg_rows} "
+                f"only_in_mirror={d.only_in_mirror} only_in_pg={d.only_in_pg}{chg}"
+            )
+        for t in skipped:
+            print(f"  SKIP {t}: not in mirror")
     return 1 if dirty else 0
 
 

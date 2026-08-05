@@ -71,10 +71,20 @@ partisipa:  manage.py dbsamizdat sync        # recreate + refresh matviews, in d
       `partisipa-import`.
 - [ ] **Single all-or-nothing transaction:** one bad row (e.g. an FK orphan) rolls
       back the whole sync. The mirror was FK-consistent here; revisit if that changes.
-- [ ] **Parity gate vs the ORM importer** — not run this session. Load the *same*
-      `.accdb` via `manage.py import_from_accessdb` into a fresh DB and
-      `validate --deep` our output against it to quantify any residual differences
-      (expected: only the `1900-01-00`→NULL cells and TRY_CAST rejects).
+- [x] **Parity gate vs the ORM importer — DONE (representative subset).** Loaded
+      the same `.accdb` via the ORM importer into an isolated `parity_orm` (FKs
+      dropped to isolate value parity from the ORM's per-row FK-skip semantics)
+      and `validate --deep`'d the mirror against it for 6 representative tables
+      (zsuco, suco_subproject, suco_operational_report, monthly_reports,
+      subproject_physical_progress, finance_monitoring). Result: **identical row
+      counts; the only value differences are the 8 intentional `1900-01-00`→NULL
+      cells** (D4). Full-table-set parity is the remaining confirmation.
+      - **Found + fixed a currency-rounding bug:** Access Currency/Double values
+        mapped to `integer` partisipa columns were *rounded* by DuckDB's cast but
+        *truncated* by the ORM's `int()`, giving off-by-one on ~360 financial
+        cells. `mapped_projection` now truncates toward zero for fractional→int
+        targets, matching the ORM. (Two behaviours differed; we chose to match
+        partisipa's existing values — revisit if rounding is actually preferred.)
 - [ ] Optional: skip unchanged *tables* entirely using the mirror's fingerprints
       (currently every table is staged every run).
 

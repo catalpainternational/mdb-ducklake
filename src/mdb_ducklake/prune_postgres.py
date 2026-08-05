@@ -57,6 +57,7 @@ def main(argv=None) -> int:
     ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
     ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
     ap.add_argument("--include", nargs="*")
+    ap.add_argument("--json", action="store_true", help="emit a structured JSON prune report")
     args = ap.parse_args(argv)
 
     import psycopg2
@@ -135,16 +136,30 @@ def main(argv=None) -> int:
 
     con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
 
-    mode = "APPLIED" if args.apply else "DRY-RUN (use --apply to delete)"
     would = [p for p in plans if p.action == "delete"]
-    print(
-        f"Prune [{mode}] schema '{args.pg_schema}': "
-        f"{len(would)} table(s) with deletions"
-        + (f", {deleted_total} rows deleted" if args.apply else "")
-    )
-    for p in plans:
-        if p.action != "nothing":
-            print(f"  {p.action:18} {p.table}: mirror={p.mirror_rows} pg={p.pg_rows} would_delete={p.to_delete}")
+    if args.json:
+        print(json.dumps({
+            "command": "prune",
+            "schema": args.pg_schema,
+            "applied": args.apply,
+            "rows_deleted": deleted_total if args.apply else None,
+            "tables_with_deletions": len(would),
+            "plans": [
+                {"table": p.table, "action": p.action, "mirror_rows": p.mirror_rows,
+                 "pg_rows": p.pg_rows, "would_delete": p.to_delete}
+                for p in plans if p.action != "nothing"
+            ],
+        }))
+    else:
+        mode = "APPLIED" if args.apply else "DRY-RUN (use --apply to delete)"
+        print(
+            f"Prune [{mode}] schema '{args.pg_schema}': "
+            f"{len(would)} table(s) with deletions"
+            + (f", {deleted_total} rows deleted" if args.apply else "")
+        )
+        for p in plans:
+            if p.action != "nothing":
+                print(f"  {p.action:18} {p.table}: mirror={p.mirror_rows} pg={p.pg_rows} would_delete={p.to_delete}")
     return 0
 
 

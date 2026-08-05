@@ -104,6 +104,9 @@ def syncable(mapping):
         yield pg_table, spec
 
 
+INTEGER_DUCK_TYPES = {"SMALLINT", "INTEGER", "BIGINT", "UTINYINT"}
+
+
 def mapped_projection(spec, src_types):
     """The mirror -> Postgres column projection, shared by sync and validate.
 
@@ -117,11 +120,20 @@ def mapped_projection(spec, src_types):
         acc, pgc = c["access_col"], c["pg_col"]
         if not acc or acc not in src_types:
             continue
+        src_type = src_types[acc].upper()
         duck_type = pg_type_to_duckdb(c["pg_type"])
         base = q(acc)
-        if src_types[acc].upper() == "TIMESTAMP" and duck_type == "TIMESTAMPTZ":
+        if src_type == "TIMESTAMP" and duck_type == "TIMESTAMPTZ":
             base = f"({base} AT TIME ZONE 'UTC')"
-        out.append((pgc, f"TRY_CAST({base} AS {duck_type})", c["is_pk"]))
+        fractional_src = any(k in src_type for k in ("DECIMAL", "DOUBLE", "FLOAT", "NUMERIC"))
+        if duck_type in INTEGER_DUCK_TYPES and fractional_src:
+            # Access Currency/Double landing in an INTEGER column: truncate toward
+            # zero to match the ORM importer's Python int() coercion — DuckDB's
+            # cast would round-to-nearest, giving off-by-one vs partisipa today.
+            cast = f"TRY_CAST(trunc({base}) AS {duck_type})"
+        else:
+            cast = f"TRY_CAST({base} AS {duck_type})"
+        out.append((pgc, cast, c["is_pk"]))
     return out
 
 
@@ -189,6 +201,7 @@ def main(argv=None) -> int:
     ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
     ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
     ap.add_argument("--include", nargs="*", help="only these pg tables")
+    ap.add_argument("--json", action="store_true", help="emit a structured JSON run report")
     args = ap.parse_args(argv)
 
     import psycopg2
@@ -251,15 +264,32 @@ def main(argv=None) -> int:
     con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
 
     bad = [r for r in results if not r.ok]
-    print(
-        f"Upserted {len(results)} tables into schema '{args.pg_schema}' "
-        f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s; load mode: {load_mode}). "
-        f"rows_written={rows_written} skipped={len(skipped)} mismatches={len(bad)}"
-    )
-    for pg_table, why in skipped:
-        print(f"  SKIP  {pg_table}: {why}")
-    for r in bad:
-        print(f"  CHECK {r.table}: mirror={r.source_rows} pg>={r.target_rows} cols={r.mapped_cols}")
+    if args.json:
+        print(json.dumps({
+            "command": "to_postgres",
+            "schema": args.pg_schema,
+            "stage_secs": round(stage_secs, 1),
+            "upsert_secs": round(upsert_secs, 1),
+            "rows_written": rows_written,
+            "load_mode": load_mode,
+            "tables_synced": len(results),
+            "tables": [
+                {"table": r.table, "mirror_rows": r.source_rows, "pg_rows": r.target_rows,
+                 "cols": r.mapped_cols, "ok": r.ok} for r in results
+            ],
+            "skipped": [{"table": t, "reason": why} for t, why in skipped],
+            "mismatches": [r.table for r in bad],
+        }))
+    else:
+        print(
+            f"Upserted {len(results)} tables into schema '{args.pg_schema}' "
+            f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s; load mode: {load_mode}). "
+            f"rows_written={rows_written} skipped={len(skipped)} mismatches={len(bad)}"
+        )
+        for pg_table, why in skipped:
+            print(f"  SKIP  {pg_table}: {why}")
+        for r in bad:
+            print(f"  CHECK {r.table}: mirror={r.source_rows} pg>={r.target_rows} cols={r.mapped_cols}")
     return 1 if bad else 0
 
 

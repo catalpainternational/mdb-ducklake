@@ -47,6 +47,18 @@ def test_mapped_projection_casts_skips_and_utc():
     assert proj[1][2] is False
 
 
+def test_mapped_projection_truncates_fractional_to_integer():
+    # Access Currency/Double -> INTEGER column must truncate (match ORM int()),
+    # not round; an integer source casts plainly (no DOUBLE precision loss).
+    spec = {"columns": [
+        {"access_col": "Amt", "pg_col": "amt", "pg_type": "integer", "is_pk": False},
+        {"access_col": "Sid", "pg_col": "sid", "pg_type": "integer", "is_pk": True},
+    ]}
+    proj = {pgc: cast for pgc, cast, _ in mapped_projection(spec, {"Amt": "DECIMAL(19,4)", "Sid": "BIGINT"})}
+    assert proj["amt"] == 'TRY_CAST(trunc("Amt") AS INTEGER)'
+    assert proj["sid"] == 'TRY_CAST("Sid" AS INTEGER)'
+
+
 def test_mapped_projection_no_utc_when_source_not_timestamp():
     # A varchar-in-mirror date column must NOT get AT TIME ZONE (would error).
     spec = {"columns": [{"access_col": "D", "pg_col": "d",
