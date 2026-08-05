@@ -129,10 +129,18 @@ Typical reconcile loop (creds via env + `sops exec-env`):
 
 ```bash
 sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-validate --mapping m.json"       # see drift
+# partisipa: manage.py dbsamizdat nuke   # drop managed matviews + their refresh triggers
 sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-to-postgres --mapping m.json"     # upsert
 sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-prune --mapping m.json --apply"   # delete gone rows
+# partisipa: manage.py dbsamizdat sync   # recreate + refresh matviews in dependency order
 sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-validate --mapping m.json --deep" # confirm clean
 ```
+
+Matview-refresh triggers on `pnds_data` tables would fire `REFRESH MATERIALIZED
+VIEW CONCURRENTLY` inside the bulk transaction (illegal). Rather than have this
+tool touch triggers, partisipa brackets the run with dbsamizdat `nuke` (drop
+managed matviews + triggers) and `sync` (recreate + refresh) — matviews are
+partisipa's read-model. The sync tool stays trigger-agnostic.
 
 Validated on a throwaway schema cloned from a partisipa pod: all 85 tables sync
 in ~30s; validate runs read-only in ~19s and reports clean after a sync;

@@ -28,32 +28,11 @@ from mdb_ducklake.to_postgres import (
     STAGING_SCHEMA,
     _dsn,
     _mirror_columns,
-    configure_bulk_session,
+    load_order,
     mapped_projection,
     q,
     syncable,
 )
-
-
-def load_order(specs: dict) -> list[str]:
-    """Parents before children (a table after all its fk_targets). DFS topo sort."""
-    order, seen, stack = [], set(), set()
-
-    def visit(t):
-        if t in seen or t not in specs:
-            return
-        if t in stack:  # cycle: best effort, don't recurse
-            return
-        stack.add(t)
-        for parent in specs[t].get("fk_targets", []):
-            visit(parent)
-        stack.discard(t)
-        seen.add(t)
-        order.append(t)
-
-    for t in specs:
-        visit(t)
-    return order
 
 
 @dataclass
@@ -135,9 +114,11 @@ def main(argv=None) -> int:
     # Apply deletes in reverse-FK order (children first), atomically.
     deleted_total = 0
     if args.apply and to_apply:
+        # Reverse-FK order (children before parents) is defensive; FK checks are
+        # deferred to commit anyway. Matview-refresh triggers are handled by
+        # partisipa's dbsamizdat nuke/recreate around the run, not here.
         order = [t for t in reversed(load_order(specs)) if t in to_apply]
         pgconn = psycopg2.connect(_dsn())
-        configure_bulk_session(pgconn)  # replica mode: no trigger/FK surprises mid-delete
         try:
             with pgconn:
                 with pgconn.cursor() as cur:

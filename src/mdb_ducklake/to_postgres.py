@@ -135,25 +135,29 @@ def stage_table(con, pg_schema, pg_table, spec, mirror_cols):
     return [(pgc, is_pk) for pgc, _, is_pk in proj]
 
 
-def configure_bulk_session(pgconn) -> str:
-    """Put the connection in `replica` mode (triggers + FK checks off) if allowed.
+def load_order(specs) -> list:
+    """Parents before children (a table after all its fk_targets). DFS topo sort.
 
-    Returns a human label of the mode chosen. Uses autocommit so a permission
-    failure doesn't poison the upcoming transaction; the SET persists on the
-    connection into the following transaction.
+    With FK checks in IMMEDIATE mode this is the order that lets upserts satisfy
+    constraints statement-by-statement; reverse it for deletes.
     """
-    import psycopg2
+    order, seen, stack = [], set(), set()
 
-    pgconn.autocommit = True
-    try:
-        with pgconn.cursor() as cur:
-            cur.execute("SET session_replication_role = replica")
-        mode = "replica (triggers + FK checks disabled during load)"
-    except psycopg2.Error:
-        pgconn.rollback()
-        mode = "deferred-constraints (no superuser; triggers still fire)"
-    pgconn.autocommit = False
-    return mode
+    def visit(t):
+        if t in seen or t not in specs:
+            return
+        if t in stack:  # cycle: best effort, don't recurse
+            return
+        stack.add(t)
+        for parent in specs[t].get("fk_targets", []):
+            visit(parent)
+        stack.discard(t)
+        seen.add(t)
+        order.append(t)
+
+    for t in specs:
+        visit(t)
+    return order
 
 
 def upsert_sql(pg_schema, pg_table, pk_col, cols):
@@ -217,14 +221,13 @@ def main(argv=None) -> int:
     stage_secs = time.time() - t0
 
     # --- Phase B: one transaction, all upserts ---
-    # Prefer a `replica` session: disables user triggers (e.g. matview-refresh
-    # triggers that would fire per statement) AND FK enforcement, so the mirror
-    # loads faithfully (Access-style, orphans and all) and fast. Requires a
-    # superuser/replication role; otherwise fall back to deferring FK checks to
-    # COMMIT (triggers still fire — refresh matviews out of band).
+    # FK enforcement stays ON, deferred to COMMIT so tables can be upserted in
+    # any order. This tool does NOT touch matview-refresh triggers: partisipa
+    # brackets the run with `dbsamizdat nuke` (drop managed matviews + their
+    # refresh triggers) beforehand and recreates/refreshes them after, so no
+    # trigger fires during the bulk load. See docs/postgres-sync-handoff.md.
     t1 = time.time()
     pgconn = psycopg2.connect(_dsn())
-    load_mode = configure_bulk_session(pgconn)
     rows_written = 0
     try:
         with pgconn:
@@ -237,6 +240,7 @@ def main(argv=None) -> int:
     finally:
         pgconn.close()
     upsert_secs = time.time() - t1
+    load_mode = "FK-enforced (deferred to commit)"
 
     # --- report + verify counts, then drop staging ---
     results = []

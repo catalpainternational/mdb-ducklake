@@ -28,31 +28,49 @@ constraints** (13, all DEFERRABLE INITIALLY DEFERRED):
 
 ## Key findings / decisions
 
-1. **Materialized-view-refresh trigger.** A `pnds_data` table has a trigger that
-   does `REFRESH MATERIALIZED VIEW CONCURRENTLY "SubprojectLatestProgress"` on
-   write (at least on the `oracle` branch). It breaks/slows a bulk load. The
-   sync therefore runs the load connection in `session_replication_role =
-   replica` (superuser), disabling **user triggers and FK enforcement** during
-   the bulk write — the mirror loads faithfully and fast — with a fallback to
-   deferred-constraints if not superuser. **Consequence: matviews are stale after
-   a sync and must be refreshed out of band** (`REFRESH MATERIALIZED VIEW …`).
-2. **Column mapping** is authoritative from partisipa's models (pydantic alias →
+1. **Materialized views are partisipa's concern — bracket the sync with dbsamizdat.**
+   The `pnds_data` schema has dbsamizdat-managed matviews; **11 of 13 read tables
+   we sync**. Two carry per-write auto-refresh triggers on *our* tables
+   (`SubprojectLatestProgress` ← subproject_physical_progress,
+   `LegacySubprojectEnriched` ← suco_subproject) whose `REFRESH MATERIALIZED VIEW
+   CONCURRENTLY` cannot run inside our bulk transaction. Rather than have the sync
+   tool touch triggers, **partisipa brackets the run**:
+   `manage.py dbsamizdat nuke` (drop all managed matviews + triggers) → our sync →
+   `manage.py dbsamizdat sync` (recreate + refresh in dependency order). The other
+   9 matviews have no write-trigger on our tables today, so they already rely on
+   this refresh cadence — no regression. The sync tool itself is trigger-agnostic
+   (plain deferred-FK transaction).
+2. **Matview inventory** (which read our synced tables): pure-ours —
+   `SubprojectLatestProgress`, `CorrectedOutputs`, `SubprojectSubSectorView`,
+   `ida_activeprojects`, `ida_districtbudget`, `ida_sucobudget`,
+   `ida_projects_per_suco_mv`, `ida_projectcountbysucostatussubsector`; mixed with
+   IDA data — `LegacySubprojectEnriched`, `ida_sucomonthlyreport`,
+   `ida_districtmonthlyreport`; unaffected — `IdaProjectInfo`,
+   `form_submission_…tf611`.
+3. **Column mapping** is authoritative from partisipa's models (pydantic alias →
    `db_column`), not a `lower()` guess — needed for the `SubpojectOutputs` typo
    case and irregular FK columns.
-3. **`1900-01-00` → NULL** (D4); the mirror keeps the original in `_mdb_cast_rejects`.
+4. **`1900-01-00` → NULL** (D4); the mirror keeps the original in `_mdb_cast_rejects`.
+
+## Production run sequence
+
+```
+partisipa:  manage.py dbsamizdat nuke        # drop managed matviews + triggers
+mdb-ducklake-to-postgres                     # bulk upsert (no triggers to conflict)
+mdb-ducklake-prune --apply                   # optional: delete rows gone from mirror
+partisipa:  manage.py dbsamizdat sync        # recreate + refresh matviews, in dep order
+```
 
 ## Before production
 
-- [ ] **Refresh matviews after each sync** (add a `--refresh-matviews` step, or run
-      it in the surrounding job). Currently a documented manual step.
+- [ ] **Wire the dbsamizdat nuke/sync bracket** into the surrounding job (partisipa
+      side). Mind the window: matviews don't exist between `nuke` and `sync`, so
+      run off-peak (Metabase cards on them would error meanwhile).
 - [ ] **Canonical mapping from partisipa `main`** — the current artifact came from
       the `oracle` feature-branch pod. Regenerate and commit the generator in
       `partisipa-import`.
-- [ ] **`replica` mode needs a superuser/replication role** on the target. Confirm
-      the production sync role qualifies, or accept the deferred-constraints
-      fallback (triggers then fire — beware the matview trigger).
-- [ ] **Single all-or-nothing transaction:** one bad row rolls back the whole sync.
-      The mirror was FK-consistent here; revisit if that ever changes.
+- [ ] **Single all-or-nothing transaction:** one bad row (e.g. an FK orphan) rolls
+      back the whole sync. The mirror was FK-consistent here; revisit if that changes.
 - [ ] **Parity gate vs the ORM importer** — not run this session. Load the *same*
       `.accdb` via `manage.py import_from_accessdb` into a fresh DB and
       `validate --deep` our output against it to quantify any residual differences
