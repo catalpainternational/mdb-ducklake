@@ -104,27 +104,35 @@ def syncable(mapping):
         yield pg_table, spec
 
 
-def stage_table(con, pg_schema, pg_table, spec, mirror_cols):
-    """DuckDB: build a Postgres staging table from the mirror. Returns column pairs."""
-    access_table = spec["access_table"]
-    src_types = mirror_cols[access_table]
-    pairs = []  # (pg_col, is_pk)
-    exprs = []
+def mapped_projection(spec, src_types):
+    """The mirror -> Postgres column projection, shared by sync and validate.
+
+    Returns [(pg_col, cast_expr, is_pk)] — one DuckDB expression per column that
+    casts the mirror value to the Postgres target type (TRY_CAST -> NULL on bad
+    values) and UTC-localizes naive timestamps. Columns absent from the mirror
+    are dropped. Guarantees validate compares exactly what sync would write.
+    """
+    out = []
     for c in spec["columns"]:
         acc, pgc = c["access_col"], c["pg_col"]
         if not acc or acc not in src_types:
-            continue  # column absent from the mirror
+            continue
         duck_type = pg_type_to_duckdb(c["pg_type"])
         base = q(acc)
-        # naive mirror TIMESTAMP -> UTC, matching the old importer's utc() validator
         if src_types[acc].upper() == "TIMESTAMP" and duck_type == "TIMESTAMPTZ":
             base = f"({base} AT TIME ZONE 'UTC')"
-        exprs.append(f"TRY_CAST({base} AS {duck_type}) AS {q(pgc)}")
-        pairs.append((pgc, c["is_pk"]))
+        out.append((pgc, f"TRY_CAST({base} AS {duck_type})", c["is_pk"]))
+    return out
+
+
+def stage_table(con, pg_schema, pg_table, spec, mirror_cols):
+    """DuckDB: build a Postgres staging table from the mirror. Returns column pairs."""
+    proj = mapped_projection(spec, mirror_cols[spec["access_table"]])
+    exprs = [f"{cast} AS {q(pgc)}" for pgc, cast, _ in proj]
     stg = f"pg.{q(STAGING_SCHEMA)}.{q(pg_table)}"
     con.execute(f"DROP TABLE IF EXISTS {stg}")
-    con.execute(f"CREATE TABLE {stg} AS SELECT {', '.join(exprs)} FROM lake.{q(access_table)}")
-    return pairs
+    con.execute(f"CREATE TABLE {stg} AS SELECT {', '.join(exprs)} FROM lake.{q(spec['access_table'])}")
+    return [(pgc, is_pk) for pgc, _, is_pk in proj]
 
 
 def upsert_sql(pg_schema, pg_table, pk_col, cols):
