@@ -228,38 +228,82 @@ def sync_csv(
     merge_staging(lake, table, pk, delete_missing=delete_missing)
 
 
+def load_full(lake: Lake, table: str, csv_path: str | Path) -> None:
+    """Replace ``lake.<table>`` entirely with the contents of a CSV file.
+
+    No primary key required — used for the initial bulk copy and for tables
+    with no known key. Types are inferred from the whole file; if inference
+    fails (mixed/awkward columns) it falls back to all-VARCHAR so the copy is
+    never lost to a parse error.
+    """
+    con = lake.con
+    qualified = f"{lake.alias}.{_quote(table)}"
+    con.execute(f"DROP TABLE IF EXISTS {qualified}")
+    typed = "SELECT * FROM read_csv(?, header=true, sample_size=-1)"
+    untyped = "SELECT * FROM read_csv(?, header=true, all_varchar=true)"
+    try:
+        con.execute(f"CREATE TABLE {qualified} AS {typed}", [str(csv_path)])
+    except duckdb.Error:
+        con.execute(f"CREATE TABLE {qualified} AS {untyped}", [str(csv_path)])
+
+
+@dataclass
+class TableResult:
+    table: str
+    source_rows: int
+    loaded_rows: int
+    ok: bool
+    error: Optional[str] = None
+
+
 def sync_access_database(
     lake: Lake,
     access_file: str | Path,
-    pks: dict[str, str | Sequence[str]],
+    pks: Optional[dict[str, str | Sequence[str]]] = None,
     include: Optional[Iterable[str]] = None,
     delete_missing: bool = True,
-) -> None:
-    """Mirror every table of an .accdb into the lake.
+    full: bool = True,
+) -> list[TableResult]:
+    """Copy every table of an .accdb into the lake, verifying row counts.
 
-    ``pks`` maps Access table name -> primary key column(s). mdbtools' schema
-    output does not currently surface primary keys, so they are supplied
-    explicitly (a future refinement can parse ALTER TABLE ... PRIMARY KEY).
+    With ``full=True`` (default) each table is fully replaced — the right mode
+    for an initial complete copy and for tables with no known primary key. With
+    ``full=False`` a table is MERGE-mirrored when a primary key is given in
+    ``pks``, else it falls back to full replace.
 
-    Requires the ``access`` extra (``pip install 'mdb-ducklake[access]'``).
+    Returns a :class:`TableResult` per table so callers can spot row-count
+    mismatches (e.g. CSV parsing dropping rows).
     """
     import tempfile
 
-    from mdb_codegen.mdbtools import AccessDatabase  # lazy: only needs the extra
+    from mdb_ducklake import access
 
-    db = AccessDatabase(Path(access_file))
+    access.ensure_installed()
+    pks = pks or {}
     include_set = set(include) if include is not None else None
-    for name, atable in db.tables.items():
-        if include_set is not None and name not in include_set:
-            continue
-        if name not in pks:
-            raise KeyError(f"No primary key configured for Access table {name!r}")
-        # mdb-export emits CSV (with a header row) on stdout; DuckDB reads CSV
-        # from a path, so stage it through a temp file.
-        with tempfile.NamedTemporaryFile(suffix=".csv") as tmp:
-            tmp.write(atable.export())
-            tmp.flush()
-            sync_csv(lake, name, tmp.name, pks[name], delete_missing=delete_missing)
+    results: list[TableResult] = []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for name in access.list_tables(access_file):
+            if include_set is not None and name not in include_set:
+                continue
+            try:
+                csv_path = Path(tmpdir) / "t.csv"
+                access.export_csv(access_file, name, csv_path)
+                if full or name not in pks:
+                    load_full(lake, name, csv_path)
+                else:
+                    sync_csv(lake, name, csv_path, pks[name], delete_missing=delete_missing)
+                source_rows = access.count(access_file, name)
+                loaded_rows = lake.con.execute(
+                    f"SELECT count(*) FROM {lake.alias}.{_quote(name)}"
+                ).fetchone()[0]
+                results.append(
+                    TableResult(name, source_rows, loaded_rows, ok=(source_rows == loaded_rows))
+                )
+            except Exception as exc:  # keep going; report per-table
+                results.append(TableResult(name, -1, -1, ok=False, error=f"{type(exc).__name__}: {exc}"))
+    return results
 
 
 def _quote(identifier: str) -> str:

@@ -10,8 +10,10 @@ build/
 # local prototype the DATA_PATH lands here and is NOT checked in.
 /data/
 
-# The DuckLake *catalog* IS checked in (see catalog/). Ignore its sidecar
-# WAL/tmp files only.
+# The DuckLake *catalog* IS checked in once we have the real S3 mirror. During
+# local prototyping it references absolute local paths, so keep it out of git
+# for now (force-add the real one deliberately later).
+catalog/*.ducklake
 catalog/*.wal
 catalog/*.tmp
 

@@ -10,10 +10,9 @@ dependencies = [
     "pytz",  # DuckDB needs it to convert DuckLake's TIMESTAMPTZ snapshot columns
 ]
 
-[project.optional-dependencies]
-# Needed only to ingest a real .accdb (pulls mdbtools' Python wrapper).
-# The DuckLake sync mechanics themselves need only duckdb.
-access = ["mdb-codegen>=0.1.11"]
+# Access ingestion shells out to the mdbtools CLI (mdb-tables/mdb-export/...),
+# which must be installed on the system (e.g. `brew install mdbtools`). There
+# is deliberately no Python dependency for it — see src/mdb_ducklake/access.py.
 
 [project.scripts]
 mdb-ducklake = "mdb_ducklake.cli:main"

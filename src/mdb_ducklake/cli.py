@@ -20,9 +20,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_access = sub.add_parser("sync", help="Mirror an .accdb into the lake")
+    p_access = sub.add_parser("sync", help="Copy an .accdb into the lake")
     p_access.add_argument("access_file", type=Path)
-    p_access.add_argument("--pks", required=True, help='JSON mapping of table name -> pk column, e.g. \'{"Village": "VillageID"}\'')
+    p_access.add_argument("--pks", default=None, help='JSON mapping of table -> pk column for incremental MERGE, e.g. \'{"Village": "VillageID"}\'. Only used with --merge.')
+    p_access.add_argument("--merge", action="store_true", help="Incremental MERGE for tables with a pk in --pks (default: full replace of every table)")
     p_access.add_argument("--include", nargs="*", help="Only sync these tables")
 
     p_csv = sub.add_parser("sync-csv", help="Mirror a single CSV into the lake (no mdbtools needed)")
@@ -43,7 +44,28 @@ def main(argv: list[str] | None = None) -> int:
     delete_missing = not args.no_delete_missing
 
     if args.command == "sync":
-        sync_access_database(lake, args.access_file, json.loads(args.pks), include=args.include, delete_missing=delete_missing)
+        pks = json.loads(args.pks) if args.pks else None
+        results = sync_access_database(
+            lake,
+            args.access_file,
+            pks=pks,
+            include=args.include,
+            delete_missing=delete_missing,
+            full=not args.merge,
+        )
+        ok = [r for r in results if r.ok]
+        bad = [r for r in results if not r.ok]
+        # NB: source_rows comes from `mdb-count`, which is unreliable on ACE
+        # (Access 2007+) files — treat mismatches as "look here", not proof of
+        # data loss. See README "Completeness".
+        print(f"Loaded {len(results)} tables; {len(ok)} matched mdb-count, {len(bad)} to review.")
+        for r in bad:
+            if r.error:
+                print(f"  ERROR  {r.table}: {r.error}")
+            else:
+                delta = r.loaded_rows - r.source_rows
+                print(f"  REVIEW {r.table}: mdb-count={r.source_rows} loaded={r.loaded_rows} ({delta:+d})")
+        return 0
     elif args.command == "sync-csv":
         sync_csv(lake, args.table, args.csv_file, args.pk, delete_missing=delete_missing)
     elif args.command == "info":
