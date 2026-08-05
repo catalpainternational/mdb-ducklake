@@ -65,15 +65,26 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 delta = r.loaded_rows - r.source_rows
                 print(f"  REVIEW {r.table}: mdb-count={r.source_rows} loaded={r.loaded_rows} ({delta:+d})")
+        _finish(lake, wrote=True)
         return 0
     elif args.command == "sync-csv":
         sync_csv(lake, args.table, args.csv_file, args.pk, delete_missing=delete_missing)
-    elif args.command == "info":
-        pass
+        print("Tables:", lake.tables())
+        print("Snapshots:", len(lake.snapshots()))
+        _finish(lake, wrote=True)
+        return 0
 
+    # info (read-only)
     print("Tables:", lake.tables())
     print("Snapshots:", len(lake.snapshots()))
     return 0
+
+
+def _finish(lake, wrote: bool) -> None:
+    """Persist an S3-backed catalog after a write (no-op locally)."""
+    if wrote and lake.catalog_uri:
+        lake.push_catalog()
+        print(f"Catalog uploaded to {lake.catalog_uri}")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ don't model it explicitly.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -44,6 +45,24 @@ class Lake:
     alias: str
     catalog_path: Path
     data_path: Path
+    # Set when the catalog is backed by an S3 object (download-before/upload-after).
+    catalog_uri: Optional[str] = None
+    s3_endpoint: Optional[str] = None
+    s3_region: Optional[str] = None
+
+    def push_catalog(self) -> None:
+        """Flush and upload the catalog back to S3 (no-op for a local catalog).
+
+        DETACH first so DuckDB merges the WAL into the single catalog file,
+        making the on-disk bytes consistent before upload. The Lake must not be
+        used for further queries after this — call it once, at the end of a run.
+        """
+        if not self.catalog_uri:
+            return
+        from mdb_ducklake import s3store
+
+        self.con.execute(f"DETACH {self.alias}")
+        s3store.upload(self.catalog_path, self.catalog_uri, self.s3_endpoint, self.s3_region)
 
     def snapshots(self) -> list[tuple]:
         return self.con.execute(
@@ -76,12 +95,11 @@ def open_lake(
     :data:`S3_KEY_ENV` / :data:`S3_SECRET_ENV`) and ``s3_endpoint``/``s3_region``
     identify the S3-compatible provider (e.g. DigitalOcean Spaces).
     """
-    catalog_path = Path(catalog_path)
-    catalog_path.parent.mkdir(parents=True, exist_ok=True)
+    from mdb_ducklake import s3store
 
     data_str = str(data_path)
-    is_s3 = data_str.startswith("s3://")
-    if is_s3:
+    data_is_s3 = data_str.startswith("s3://")
+    if data_is_s3:
         if not data_str.endswith("/"):
             data_str += "/"
     elif "://" not in data_str:
@@ -89,16 +107,37 @@ def open_lake(
         Path(data_path).mkdir(parents=True, exist_ok=True)
         data_str = str(Path(data_path).resolve()) + "/"
 
+    # The catalog is either a local file or an S3 object mirrored to a local
+    # temp file (S3 is the source of truth; we download it before use).
+    catalog_uri: Optional[str] = None
+    catalog_str = str(catalog_path)
+    if s3store.is_s3_uri(catalog_str):
+        catalog_uri = catalog_str
+        local = Path(tempfile.gettempdir()) / f"ducklake_{Path(s3store.parse_s3_uri(catalog_str)[1]).name}"
+        s3store.download(catalog_uri, local, s3_endpoint, s3_region)  # False if new -> fresh catalog
+        catalog_path = local
+    else:
+        catalog_path = Path(catalog_path)
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+
     con = con or duckdb.connect()
     con.execute("INSTALL ducklake")
     con.execute("LOAD ducklake")
-    if is_s3:
+    if data_is_s3 or catalog_uri:
         _configure_s3(con, s3_endpoint, s3_region, s3_url_style)
     con.execute(
         f"ATTACH IF NOT EXISTS 'ducklake:{catalog_path}' AS {alias} "
         f"(DATA_PATH '{data_str}')"
     )
-    return Lake(con=con, alias=alias, catalog_path=catalog_path, data_path=Path(data_str))
+    return Lake(
+        con=con,
+        alias=alias,
+        catalog_path=catalog_path,
+        data_path=Path(data_str),
+        catalog_uri=catalog_uri,
+        s3_endpoint=s3_endpoint,
+        s3_region=s3_region,
+    )
 
 
 def _sql_str(value: str) -> str:
@@ -274,8 +313,6 @@ def sync_access_database(
     Returns a :class:`TableResult` per table so callers can spot row-count
     mismatches (e.g. CSV parsing dropping rows).
     """
-    import tempfile
-
     from mdb_ducklake import access
 
     access.ensure_installed()
