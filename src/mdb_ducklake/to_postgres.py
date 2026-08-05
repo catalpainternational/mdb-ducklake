@@ -1,0 +1,217 @@
+"""Set-based sync: DuckLake mirror -> partisipa Postgres (Option B).
+
+Upsert-only and idempotent. For each mapped table, DuckDB streams the mirror's
+Parquet into a Postgres staging table (mapping Access column names -> Postgres
+names, TRY_CAST to the Postgres target type so a bad value becomes NULL rather
+than dropping a row, and localizing naive timestamps to UTC). Then a single
+psycopg2 transaction runs every `INSERT ... ON CONFLICT (pk) DO UPDATE`; Django
+foreign keys are DEFERRABLE INITIALLY DEFERRED, so tables can be upserted in any
+order and constraints are checked once at COMMIT.
+
+Deletion of rows no longer present in the mirror is a SEPARATE, guarded command
+(see prune_postgres.py) — never a side effect of this sync.
+
+Mapping artifact: produced by partisipa's `manage.py dump_ducklake_mapping`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+
+from mdb_ducklake.sync import open_lake
+
+STAGING_SCHEMA = "mdb_stg"
+
+
+def _dsn() -> str:
+    parts = dict(
+        host=os.environ.get("PGHOST", "localhost"),
+        port=os.environ.get("PGPORT", "5432"),
+        dbname=os.environ.get("PGDATABASE", "partisipa_db"),
+        user=os.environ.get("PGUSER", "partisipa"),
+        password=os.environ["PGPASSWORD"],
+    )
+    return " ".join(f"{k}={v}" for k, v in parts.items())
+
+
+def q(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
+_NUM = re.compile(r"numeric\((\d+),\s*(\d+)\)", re.I)
+
+
+def pg_type_to_duckdb(pg_type: str) -> str:
+    """Map a Postgres type (from the mapping) to a DuckDB cast target.
+
+    Precision is preserved for numeric so TRY_CAST matches the target exactly
+    (and nulls out overflows). varchar length is dropped (DuckDB VARCHAR is
+    unbounded; Access text is short).
+    """
+    t = pg_type.strip().lower()
+    m = _NUM.match(t)
+    if m:
+        return f"DECIMAL({m.group(1)},{m.group(2)})"
+    if t.startswith(("varchar", "character varying", "char", "text", "uuid", "citext")):
+        return "VARCHAR"
+    return {
+        "integer": "INTEGER",
+        "bigint": "BIGINT",
+        "smallint": "SMALLINT",
+        "boolean": "BOOLEAN",
+        "double precision": "DOUBLE",
+        "real": "FLOAT",
+        "numeric": "DECIMAL(19,4)",
+        "date": "DATE",
+        "timestamp with time zone": "TIMESTAMPTZ",
+        "timestamp without time zone": "TIMESTAMP",
+    }.get(t, "VARCHAR")
+
+
+@dataclass
+class TableResult:
+    table: str
+    source_rows: int
+    target_rows: int
+    mapped_cols: int
+    ok: bool
+    note: str = ""
+
+
+def _mirror_columns(con):
+    """{lake_table: {col: duckdb_type}} for every table in the attached mirror."""
+    rows = con.execute(
+        "SELECT table_name, column_name, data_type FROM information_schema.columns "
+        "WHERE table_catalog='lake'"
+    ).fetchall()
+    out: dict[str, dict[str, str]] = {}
+    for tbl, col, typ in rows:
+        out.setdefault(tbl, {})[col] = typ
+    return out
+
+
+def syncable(mapping):
+    """Yield (pg_table, spec) for real, mirror-backed tables (skip views)."""
+    for pg_table, spec in mapping["tables"].items():
+        if not spec.get("access_table") or not spec.get("pk_access_col"):
+            continue  # a view / not mirror-sourced
+        yield pg_table, spec
+
+
+def stage_table(con, pg_schema, pg_table, spec, mirror_cols):
+    """DuckDB: build a Postgres staging table from the mirror. Returns column pairs."""
+    access_table = spec["access_table"]
+    src_types = mirror_cols[access_table]
+    pairs = []  # (pg_col, is_pk)
+    exprs = []
+    for c in spec["columns"]:
+        acc, pgc = c["access_col"], c["pg_col"]
+        if not acc or acc not in src_types:
+            continue  # column absent from the mirror
+        duck_type = pg_type_to_duckdb(c["pg_type"])
+        base = q(acc)
+        # naive mirror TIMESTAMP -> UTC, matching the old importer's utc() validator
+        if src_types[acc].upper() == "TIMESTAMP" and duck_type == "TIMESTAMPTZ":
+            base = f"({base} AT TIME ZONE 'UTC')"
+        exprs.append(f"TRY_CAST({base} AS {duck_type}) AS {q(pgc)}")
+        pairs.append((pgc, c["is_pk"]))
+    stg = f"pg.{q(STAGING_SCHEMA)}.{q(pg_table)}"
+    con.execute(f"DROP TABLE IF EXISTS {stg}")
+    con.execute(f"CREATE TABLE {stg} AS SELECT {', '.join(exprs)} FROM lake.{q(access_table)}")
+    return pairs
+
+
+def upsert_sql(pg_schema, pg_table, pk_col, cols):
+    collist = ", ".join(q(c) for c in cols)
+    non_pk = [c for c in cols if c != pk_col]
+    setlist = ", ".join(f"{q(c)}=EXCLUDED.{q(c)}" for c in non_pk) or f"{q(pk_col)}={q(pk_col)}"
+    return (
+        f"INSERT INTO {q(pg_schema)}.{q(pg_table)} ({collist}) "
+        f"SELECT {collist} FROM {q(STAGING_SCHEMA)}.{q(pg_table)} "
+        f"ON CONFLICT ({q(pk_col)}) DO UPDATE SET {setlist}"
+    )
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="mdb-ducklake-to-postgres", description=__doc__)
+    ap.add_argument("--mapping", required=True, help="ducklake_pg_mapping.json")
+    ap.add_argument("--pg-schema", default="public", help="target Postgres schema")
+    ap.add_argument("--catalog", default=os.environ.get("DUCKLAKE_CATALOG", "s3://ducklake/pnds/catalog.ducklake"))
+    ap.add_argument("--data-path", default=os.environ.get("DUCKLAKE_DATA", "s3://ducklake/pnds/data"))
+    ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
+    ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
+    ap.add_argument("--include", nargs="*", help="only these pg tables")
+    args = ap.parse_args(argv)
+
+    import psycopg2
+
+    mapping = json.load(open(args.mapping))
+    lake = open_lake(args.catalog, args.data_path, s3_endpoint=args.s3_endpoint, s3_region=args.s3_region)
+    con = lake.con
+    con.execute("SET enable_progress_bar=false")  # keep stdout clean for the report
+    con.execute("INSTALL postgres")
+    con.execute("LOAD postgres")
+    con.execute(f"ATTACH '{_dsn()}' AS pg (TYPE postgres)")
+    con.execute(f"CREATE SCHEMA IF NOT EXISTS pg.{q(STAGING_SCHEMA)}")
+    mirror_cols = _mirror_columns(con)
+
+    tables = [(t, s) for t, s in syncable(mapping)]
+    if args.include:
+        want = set(args.include)
+        tables = [(t, s) for t, s in tables if t in want]
+
+    # --- Phase A: DuckDB streams mirror -> Postgres staging (order-independent) ---
+    staged = []  # (pg_table, spec, pairs)
+    skipped = []
+    t0 = time.time()
+    for pg_table, spec in tables:
+        if spec["access_table"] not in mirror_cols:
+            skipped.append((pg_table, f"no mirror table {spec['access_table']!r}"))
+            continue
+        pairs = stage_table(con, args.pg_schema, pg_table, spec, mirror_cols)
+        staged.append((pg_table, spec, pairs))
+    stage_secs = time.time() - t0
+
+    # --- Phase B: one transaction, all upserts (deferred FKs check at COMMIT) ---
+    t1 = time.time()
+    pgconn = psycopg2.connect(_dsn())
+    try:
+        with pgconn:
+            with pgconn.cursor() as cur:
+                cur.execute("SET CONSTRAINTS ALL DEFERRED")
+                for pg_table, spec, pairs in staged:
+                    cols = [c for c, _ in pairs]
+                    cur.execute(upsert_sql(args.pg_schema, pg_table, spec["pk_pg_col"], cols))
+    finally:
+        pgconn.close()
+    upsert_secs = time.time() - t1
+
+    # --- report + verify counts, then drop staging ---
+    results = []
+    for pg_table, spec, pairs in staged:
+        src = con.execute(f'SELECT count(*) FROM lake.{q(spec["access_table"])}').fetchone()[0]
+        tgt = con.execute(f"SELECT count(*) FROM pg.{q(args.pg_schema)}.{q(pg_table)}").fetchone()[0]
+        results.append(TableResult(pg_table, src, tgt, len(pairs), ok=(src <= tgt)))
+    con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
+
+    bad = [r for r in results if not r.ok]
+    print(
+        f"Upserted {len(results)} tables into schema '{args.pg_schema}' "
+        f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s). "
+        f"skipped={len(skipped)} mismatches={len(bad)}"
+    )
+    for pg_table, why in skipped:
+        print(f"  SKIP  {pg_table}: {why}")
+    for r in bad:
+        print(f"  CHECK {r.table}: mirror={r.source_rows} pg>={r.target_rows} cols={r.mapped_cols}")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
