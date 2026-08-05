@@ -14,3 +14,7 @@ build/
 # WAL/tmp files only.
 catalog/*.wal
 catalog/*.tmp
+
+# Only encrypted secrets (*.enc.env) may be committed. Never a plaintext .env.
+*.env
+!*.enc.env

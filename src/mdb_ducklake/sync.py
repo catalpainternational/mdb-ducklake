@@ -13,11 +13,27 @@ don't model it explicitly.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 import duckdb
+
+# Credentials are read from the environment so they can be injected at runtime
+# (e.g. `sops exec-env pgbackrest.env ...`) and never live in code or logs.
+# First match wins; the pgbackrest names let a DO Spaces backup secret be
+# reused as-is.
+S3_KEY_ENV = ("MDB_DUCKLAKE_S3_KEY_ID", "PGBACKREST_REPO2_S3_KEY", "AWS_ACCESS_KEY_ID")
+S3_SECRET_ENV = ("MDB_DUCKLAKE_S3_SECRET", "PGBACKREST_REPO2_S3_KEY_SECRET", "AWS_SECRET_ACCESS_KEY")
+
+
+def _first_env(names: Sequence[str]) -> Optional[str]:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
 
 
 @dataclass
@@ -48,29 +64,86 @@ def open_lake(
     data_path: str | Path,
     alias: str = "lake",
     con: Optional[duckdb.DuckDBPyConnection] = None,
+    s3_endpoint: Optional[str] = None,
+    s3_region: Optional[str] = None,
+    s3_url_style: str = "vhost",
 ) -> Lake:
     """Attach (creating if needed) a DuckLake and return a :class:`Lake`.
 
     ``catalog_path`` is a DuckDB file (checked into the repo). ``data_path`` is
-    a directory for local prototyping or an ``s3://`` prefix in production.
+    a directory for local prototyping or an ``s3://`` prefix in production. For
+    an ``s3://`` path, credentials are read from the environment (see
+    :data:`S3_KEY_ENV` / :data:`S3_SECRET_ENV`) and ``s3_endpoint``/``s3_region``
+    identify the S3-compatible provider (e.g. DigitalOcean Spaces).
     """
     catalog_path = Path(catalog_path)
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Local prototype: ensure the data dir exists. For s3:// leave it alone.
     data_str = str(data_path)
-    if "://" not in data_str:
+    is_s3 = data_str.startswith("s3://")
+    if is_s3:
+        if not data_str.endswith("/"):
+            data_str += "/"
+    elif "://" not in data_str:
+        # Local prototype: ensure the data dir exists.
         Path(data_path).mkdir(parents=True, exist_ok=True)
         data_str = str(Path(data_path).resolve()) + "/"
 
     con = con or duckdb.connect()
     con.execute("INSTALL ducklake")
     con.execute("LOAD ducklake")
+    if is_s3:
+        _configure_s3(con, s3_endpoint, s3_region, s3_url_style)
     con.execute(
         f"ATTACH IF NOT EXISTS 'ducklake:{catalog_path}' AS {alias} "
         f"(DATA_PATH '{data_str}')"
     )
     return Lake(con=con, alias=alias, catalog_path=catalog_path, data_path=Path(data_str))
+
+
+def _sql_str(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _configure_s3(
+    con: duckdb.DuckDBPyConnection,
+    endpoint: Optional[str],
+    region: Optional[str],
+    url_style: str,
+    secret_name: str = "mdb_ducklake_s3",
+) -> None:
+    """Register a DuckDB S3 secret from environment credentials.
+
+    The secret value is only ever inlined into the CREATE SECRET statement,
+    which is never logged; on failure we raise a scrubbed error so the key
+    cannot leak through an exception message.
+    """
+    key_id = _first_env(S3_KEY_ENV)
+    secret = _first_env(S3_SECRET_ENV)
+    if not key_id or not secret:
+        raise RuntimeError(
+            "s3:// DATA_PATH needs credentials in the environment "
+            f"(one of {S3_KEY_ENV} and {S3_SECRET_ENV}). "
+            "Inject them at runtime, e.g. `sops exec-env s3.enc.env <command>`."
+        )
+
+    con.execute("INSTALL httpfs")
+    con.execute("LOAD httpfs")
+
+    parts = [
+        "TYPE s3",
+        f"KEY_ID {_sql_str(key_id)}",
+        f"SECRET {_sql_str(secret)}",
+        f"URL_STYLE {_sql_str(url_style)}",
+    ]
+    if endpoint:
+        parts.append(f"ENDPOINT {_sql_str(endpoint)}")
+    if region:
+        parts.append(f"REGION {_sql_str(region)}")
+    try:
+        con.execute(f"CREATE OR REPLACE SECRET {secret_name} ({', '.join(parts)})")
+    except duckdb.Error as exc:  # scrub: never surface the inlined secret
+        raise RuntimeError(f"Failed to create DuckDB S3 secret: {type(exc).__name__}") from None
 
 
 def _describe(con: duckdb.DuckDBPyConnection, relation: str) -> list[str]:

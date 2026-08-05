@@ -44,11 +44,32 @@ git add catalog/catalog.ducklake && git commit -m "sync $(date -I)"
 Primary keys are supplied explicitly for now — mdbtools' schema output doesn't
 surface them. See **Status** below.
 
+### S3 DATA_PATH (DigitalOcean Spaces)
+
+Credentials live encrypted in `s3.enc.env` (SOPS + the org's SSH-key
+recipients) and are injected only into the child process at runtime — they
+never touch code, logs, or the shell history:
+
+```bash
+sops exec-env s3.enc.env 'uv run mdb-ducklake \
+  --data-path s3://ducklake/mirror \
+  --s3-endpoint sgp1.digitaloceanspaces.com --s3-region sgp1 \
+  sync path/to/db.accdb --pks '"'"'{"Village": "VillageID"}'"'"''
+
+# Prove the S3 round-trip end-to-end (no .accdb needed):
+sops exec-env s3.enc.env 'uv run python examples/s3_smoke.py'
+```
+
+`open_lake` reads the key/secret from `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` (also accepts `MDB_DUCKLAKE_S3_*` or the pgbackrest
+names) and registers a DuckDB S3 secret. To edit the encrypted creds:
+`sops s3.enc.env`.
+
 ## Status — prototype
 
-Working: local `DATA_PATH`, MERGE-based mirror (insert/update/delete-missing),
-snapshots + time-travel, CSV and `.accdb` ingestion.
+Working: local **and S3** (`s3://`, DigitalOcean Spaces) `DATA_PATH`,
+MERGE-based mirror (insert/update/delete-missing), snapshots + time-travel,
+CSV and `.accdb` ingestion, SOPS-encrypted credentials via `sops exec-env`.
 
-Not yet: S3 `DATA_PATH` (design supports it — just pass an `s3://` prefix +
-DuckDB `httpfs`/secret config), automatic primary-key detection, explicit
-Access→DuckDB type mapping (currently inferred from CSV).
+Not yet: automatic primary-key detection (supplied via `--pks` for now),
+explicit Access→DuckDB type mapping (currently inferred from CSV).

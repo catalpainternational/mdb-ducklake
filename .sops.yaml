@@ -1,0 +1,9 @@
+# Encrypt *.enc.env to the same SSH-key recipients the org uses elsewhere, so
+# holders of the matching SSH private keys can decrypt with `sops -d` /
+# `sops exec-env`. Rotate these creds and recipients as needed.
+creation_rules:
+  - path_regex: \.enc\.env$
+    age: >-
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDnTMNeoxB4M0vwsbC02XXQop9iz8vHD+/L5lNqqmuCO,
+
+      ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC9LLYi25ONtaPu6gQEFP2dK9ommXg3ftMq5aONradXwFh1fTMRUpVut0kmKRumtAXkglloXqaK/e0dCmgfcz3D1YQhPwnTmpf/NSCqLFhmw+SQLvcv/oNnVZyrcUlVAQ222u23ZN6DDZKpKHG+iO9GRZczGlVgUNHm090rkg8fsTSiPfrJvfR+V2MmV+tISB3IyKFkukxtpw9h6NS7TYiydMfBFQm0E5FAFM2CrCGgotb3+bgVxQa5ZAc0vQ4OIIttAjh9GF0rGOrYWT9SiigB6at4tmxetrIGbrjXJsZ5SOCwtLlhVhLnHvL+TxsUw1LVgbmrLjC44ag/l3g8+yf9

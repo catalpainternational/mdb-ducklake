@@ -13,6 +13,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mdb-ducklake", description=__doc__)
     parser.add_argument("--catalog", default="catalog/catalog.ducklake", help="DuckLake catalog file (checked into the repo)")
     parser.add_argument("--data-path", default="data", help="DATA_PATH for parquet: a local dir, or an s3:// prefix")
+    parser.add_argument("--s3-endpoint", default=None, help="S3 endpoint host for an s3:// DATA_PATH, e.g. sgp1.digitaloceanspaces.com")
+    parser.add_argument("--s3-region", default=None, help="S3 region for an s3:// DATA_PATH, e.g. sgp1")
+    parser.add_argument("--s3-url-style", default="vhost", choices=["vhost", "path"], help="S3 URL style (DigitalOcean Spaces uses vhost)")
     parser.add_argument("--no-delete-missing", action="store_true", help="Keep rows that have vanished from the source (default: mirror, so delete them)")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -30,7 +33,13 @@ def main(argv: list[str] | None = None) -> int:
     p_info = sub.add_parser("info", help="List tables and snapshots in the lake")
 
     args = parser.parse_args(argv)
-    lake = open_lake(args.catalog, args.data_path)
+    lake = open_lake(
+        args.catalog,
+        args.data_path,
+        s3_endpoint=args.s3_endpoint,
+        s3_region=args.s3_region,
+        s3_url_style=args.s3_url_style,
+    )
     delete_missing = not args.no_delete_missing
 
     if args.command == "sync":
