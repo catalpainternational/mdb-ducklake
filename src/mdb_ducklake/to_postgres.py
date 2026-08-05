@@ -135,6 +135,27 @@ def stage_table(con, pg_schema, pg_table, spec, mirror_cols):
     return [(pgc, is_pk) for pgc, _, is_pk in proj]
 
 
+def configure_bulk_session(pgconn) -> str:
+    """Put the connection in `replica` mode (triggers + FK checks off) if allowed.
+
+    Returns a human label of the mode chosen. Uses autocommit so a permission
+    failure doesn't poison the upcoming transaction; the SET persists on the
+    connection into the following transaction.
+    """
+    import psycopg2
+
+    pgconn.autocommit = True
+    try:
+        with pgconn.cursor() as cur:
+            cur.execute("SET session_replication_role = replica")
+        mode = "replica (triggers + FK checks disabled during load)"
+    except psycopg2.Error:
+        pgconn.rollback()
+        mode = "deferred-constraints (no superuser; triggers still fire)"
+    pgconn.autocommit = False
+    return mode
+
+
 def upsert_sql(pg_schema, pg_table, pk_col, cols):
     collist = ", ".join(q(c) for c in cols)
     non_pk = [c for c in cols if c != pk_col]
@@ -186,9 +207,15 @@ def main(argv=None) -> int:
         staged.append((pg_table, spec, pairs))
     stage_secs = time.time() - t0
 
-    # --- Phase B: one transaction, all upserts (deferred FKs check at COMMIT) ---
+    # --- Phase B: one transaction, all upserts ---
+    # Prefer a `replica` session: disables user triggers (e.g. matview-refresh
+    # triggers that would fire per statement) AND FK enforcement, so the mirror
+    # loads faithfully (Access-style, orphans and all) and fast. Requires a
+    # superuser/replication role; otherwise fall back to deferring FK checks to
+    # COMMIT (triggers still fire — refresh matviews out of band).
     t1 = time.time()
     pgconn = psycopg2.connect(_dsn())
+    load_mode = configure_bulk_session(pgconn)
     try:
         with pgconn:
             with pgconn.cursor() as cur:
@@ -211,7 +238,7 @@ def main(argv=None) -> int:
     bad = [r for r in results if not r.ok]
     print(
         f"Upserted {len(results)} tables into schema '{args.pg_schema}' "
-        f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s). "
+        f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s; load mode: {load_mode}). "
         f"skipped={len(skipped)} mismatches={len(bad)}"
     )
     for pg_table, why in skipped:

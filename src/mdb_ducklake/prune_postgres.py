@@ -28,6 +28,7 @@ from mdb_ducklake.to_postgres import (
     STAGING_SCHEMA,
     _dsn,
     _mirror_columns,
+    configure_bulk_session,
     mapped_projection,
     q,
     syncable,
@@ -136,6 +137,7 @@ def main(argv=None) -> int:
     if args.apply and to_apply:
         order = [t for t in reversed(load_order(specs)) if t in to_apply]
         pgconn = psycopg2.connect(_dsn())
+        configure_bulk_session(pgconn)  # replica mode: no trigger/FK surprises mid-delete
         try:
             with pgconn:
                 with pgconn.cursor() as cur:
