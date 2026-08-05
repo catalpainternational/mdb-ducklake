@@ -160,11 +160,20 @@ def upsert_sql(pg_schema, pg_table, pk_col, cols):
     collist = ", ".join(q(c) for c in cols)
     non_pk = [c for c in cols if c != pk_col]
     setlist = ", ".join(f"{q(c)}=EXCLUDED.{q(c)}" for c in non_pk) or f"{q(pk_col)}={q(pk_col)}"
-    return (
+    sql = (
         f"INSERT INTO {q(pg_schema)}.{q(pg_table)} ({collist}) "
         f"SELECT {collist} FROM {q(STAGING_SCHEMA)}.{q(pg_table)} "
         f"ON CONFLICT ({q(pk_col)}) DO UPDATE SET {setlist}"
     )
+    # Change-filter: only rewrite a matched row when some value actually differs,
+    # so re-syncs don't churn every row (less WAL, fewer dead tuples). rowcount
+    # then reflects inserts + genuine updates.
+    if non_pk:
+        pred = " OR ".join(
+            f"{q(pg_table)}.{q(c)} IS DISTINCT FROM EXCLUDED.{q(c)}" for c in non_pk
+        )
+        sql += f" WHERE {pred}"
+    return sql
 
 
 def main(argv=None) -> int:
@@ -216,6 +225,7 @@ def main(argv=None) -> int:
     t1 = time.time()
     pgconn = psycopg2.connect(_dsn())
     load_mode = configure_bulk_session(pgconn)
+    rows_written = 0
     try:
         with pgconn:
             with pgconn.cursor() as cur:
@@ -223,6 +233,7 @@ def main(argv=None) -> int:
                 for pg_table, spec, pairs in staged:
                     cols = [c for c, _ in pairs]
                     cur.execute(upsert_sql(args.pg_schema, pg_table, spec["pk_pg_col"], cols))
+                    rows_written += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     finally:
         pgconn.close()
     upsert_secs = time.time() - t1
@@ -239,7 +250,7 @@ def main(argv=None) -> int:
     print(
         f"Upserted {len(results)} tables into schema '{args.pg_schema}' "
         f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s; load mode: {load_mode}). "
-        f"skipped={len(skipped)} mismatches={len(bad)}"
+        f"rows_written={rows_written} skipped={len(skipped)} mismatches={len(bad)}"
     )
     for pg_table, why in skipped:
         print(f"  SKIP  {pg_table}: {why}")
