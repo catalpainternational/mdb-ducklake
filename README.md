@@ -110,5 +110,36 @@ data loss. Two known mdbtools gaps on the PNDS file, accepted as out-of-scope:
 `zFreebalance_Budget_extract` (genuinely empty). See the memory note
 `mdbtools-ace-fidelity` for the full audit.
 
-Not yet: automatic primary-key detection (supplied via `--pks` for `--merge`),
-explicit Access→DuckDB type mapping (currently inferred from CSV/JSON).
+Not yet: automatic primary-key detection (supplied via `--pks` for `--merge`).
+
+## Postgres sync — partisipa (Option B)
+
+Push the mirror into partisipa's Postgres set-based, bypassing the row-by-row
+Django ORM importer. Three commands, all reading the mapping artifact produced by
+partisipa's `manage.py dump_ducklake_mapping` (Access col → Postgres col/type,
+PK, FK graph):
+
+| Command | What it does |
+|---|---|
+| `mdb-ducklake-validate` | **read-only** reconcile: per-table row counts, PK-set diffs, and (`--deep`) changed-row counts. Clean ⇒ a sync would no-op. |
+| `mdb-ducklake-to-postgres` | upsert: DuckDB streams Parquet → PG staging (`TRY_CAST` to target type, UTC timestamps), then one psycopg2 transaction of `INSERT … ON CONFLICT DO UPDATE` (deferred FKs). Never deletes. |
+| `mdb-ducklake-prune` | guarded delete of rows gone from the mirror. **Dry-run by default**; `--apply` to delete. Skips empty-mirror tables and tables exceeding `--max-delete-fraction`; deletes children-before-parents in one transaction. |
+
+Typical reconcile loop (creds via env + `sops exec-env`):
+
+```bash
+sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-validate --mapping m.json"       # see drift
+sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-to-postgres --mapping m.json"     # upsert
+sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-prune --mapping m.json --apply"   # delete gone rows
+sops exec-env s3.enc.env "PGPASSWORD=… uv run mdb-ducklake-validate --mapping m.json --deep" # confirm clean
+```
+
+Validated on a throwaway schema cloned from a partisipa pod: all 85 tables sync
+in ~30s; validate runs read-only in ~19s and reports clean after a sync;
+prune's empty-mirror guard refuses to wipe rows for tables the mirror reads as 0
+(e.g. `syncimportlog`). PG connection via `PGHOST/PGPORT/PGDATABASE/PGUSER/
+PGPASSWORD`, target `--pg-schema`. Views (no source alias) are skipped.
+
+> Still to validate before production: a run against the **real schema with FK
+> constraints** (the test clones use `LIKE`, which drops FKs), and a mapping
+> generated from partisipa `main` (this one is from a feature-branch pod).
