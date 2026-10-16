@@ -18,19 +18,22 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import time
 from dataclasses import dataclass
+from typing import Optional
 
-from mdb_ducklake.sync import open_lake
 from mdb_ducklake.to_postgres import (
     STAGING_SCHEMA,
-    _dsn,
+    LakeConfig,
     _mirror_columns,
+    add_lake_args,
+    dsn_from_env,
+    lake_from_args,
     load_order,
     mapped_projection,
+    mirror_and_postgres,
     q,
+    selected_tables,
     syncable,
 )
 
@@ -44,51 +47,37 @@ class Prune:
     action: str  # "delete" | "skip:empty-mirror" | "skip:fraction" | "nothing"
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="mdb-ducklake-prune", description=__doc__)
-    ap.add_argument("--mapping", required=True)
-    ap.add_argument("--pg-schema", default="public")
-    ap.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
-    ap.add_argument("--max-delete-fraction", type=float, default=0.10,
-                    help="skip a table if deletes exceed this fraction of its PG rows")
-    ap.add_argument("--force", action="store_true", help="ignore the fraction guard (empty-mirror guard still applies)")
-    ap.add_argument("--catalog", default=os.environ.get("DUCKLAKE_CATALOG", "s3://ducklake/pnds/catalog.ducklake"))
-    ap.add_argument("--data-path", default=os.environ.get("DUCKLAKE_DATA", "s3://ducklake/pnds/data"))
-    ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
-    ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
-    ap.add_argument("--include", nargs="*")
-    ap.add_argument("--json", action="store_true", help="emit a structured JSON prune report")
-    args = ap.parse_args(argv)
+def prune(mapping: dict, *, dsn: str, lake: LakeConfig, apply: bool = False,
+          max_delete_fraction: float = 0.10, force: bool = False,
+          include: Optional[list] = None, pg_schema: str = "public") -> dict:
+    """Delete Postgres rows that are gone from the mirror. Dry run unless apply=True.
 
+    Never prunes a table whose mirror is empty; skips a table whose deletions
+    would exceed max_delete_fraction of its Postgres rows unless force=True.
+    Returns the report the CLI prints with --json: `plans` lists every table
+    with rows to delete and the action taken (including skipped ones); `rows_deleted` is the number
+    deleted (None on a dry run).
+    """
     import psycopg2
 
-    mapping = json.load(open(args.mapping))
-    lake = open_lake(args.catalog, args.data_path, s3_endpoint=args.s3_endpoint, s3_region=args.s3_region)
-    con = lake.con
-    con.execute("SET enable_progress_bar=false")
-    con.execute("INSTALL postgres")
-    con.execute("LOAD postgres")
-    con.execute(f"ATTACH '{_dsn()}' AS pg (TYPE postgres)")
-    con.execute(f"CREATE SCHEMA IF NOT EXISTS pg.{q(STAGING_SCHEMA)}")
-    mirror_cols = _mirror_columns(con)
+    with mirror_and_postgres(lake, dsn, read_only=False, staging=True) as con:
+        return _prune(con, mapping, dsn, apply, max_delete_fraction, force, include, pg_schema, psycopg2)
 
+
+def _prune(con, mapping, dsn, apply, max_delete_fraction, force, include, pg_schema, psycopg2) -> dict:
+    mirror_cols = _mirror_columns(con)
     specs = {t: s for t, s in syncable(mapping)}
-    tables = list(specs)
-    if args.include:
-        want = set(args.include)
-        tables = [t for t in tables if t in want]
 
     # Assess every table (stage mirror PKs, count deletions), applying guards.
     plans, to_apply = [], {}   # to_apply: pg_table -> pk_pg_col
-    for pg_table in tables:
-        spec = specs[pg_table]
+    for pg_table, spec in selected_tables(mapping, include):
         if spec["access_table"] not in mirror_cols:
             continue
         src_types = mirror_cols[spec["access_table"]]
         pk_pg = spec["pk_pg_col"]
         pk_cast = next(cast for pgc, cast, is_pk in mapped_projection(spec, src_types) if is_pk)
         lake_t = f"lake.{q(spec['access_table'])}"
-        pg_t = f"pg.{q(args.pg_schema)}.{q(pg_table)}"
+        pg_t = f"pg.{q(pg_schema)}.{q(pg_table)}"
 
         mirror_rows = con.execute(f"SELECT count(*) FROM {lake_t}").fetchone()[0]
         pg_rows = con.execute(f"SELECT count(*) FROM {pg_t}").fetchone()[0]
@@ -105,7 +94,7 @@ def main(argv=None) -> int:
             action = "nothing"
         elif mirror_rows == 0:
             action = "skip:empty-mirror"
-        elif not args.force and pg_rows and (to_delete / pg_rows) > args.max_delete_fraction:
+        elif not force and pg_rows and (to_delete / pg_rows) > max_delete_fraction:
             action = "skip:fraction"
         else:
             action = "delete"
@@ -114,12 +103,12 @@ def main(argv=None) -> int:
 
     # Apply deletes in reverse-FK order (children first), atomically.
     deleted_total = 0
-    if args.apply and to_apply:
+    if apply and to_apply:
         # Reverse-FK order (children before parents) is defensive; FK checks are
         # deferred to commit anyway. Matview-refresh triggers are handled by
         # partisipa's dbsamizdat nuke/recreate around the run, not here.
         order = [t for t in reversed(load_order(specs)) if t in to_apply]
-        pgconn = psycopg2.connect(_dsn())
+        pgconn = psycopg2.connect(dsn)
         try:
             with pgconn:
                 with pgconn.cursor() as cur:
@@ -127,39 +116,57 @@ def main(argv=None) -> int:
                     for pg_table in order:
                         pk_pg = to_apply[pg_table]
                         cur.execute(
-                            f"DELETE FROM {q(args.pg_schema)}.{q(pg_table)} "
+                            f"DELETE FROM {q(pg_schema)}.{q(pg_table)} "
                             f"WHERE {q(pk_pg)} NOT IN (SELECT {q(pk_pg)} FROM {STAGING_SCHEMA}.{q(pg_table + '_pk')})"
                         )
                         deleted_total += cur.rowcount
         finally:
             pgconn.close()
 
-    con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
+    return {
+        "command": "prune",
+        "schema": pg_schema,
+        "applied": apply,
+        "rows_deleted": deleted_total if apply else None,
+        "tables_with_deletions": len([p for p in plans if p.action == "delete"]),
+        "plans": [
+            {"table": p.table, "action": p.action, "mirror_rows": p.mirror_rows,
+             "pg_rows": p.pg_rows, "would_delete": p.to_delete}
+            for p in plans if p.action != "nothing"
+        ],
+    }
 
-    would = [p for p in plans if p.action == "delete"]
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="mdb-ducklake-prune", description=__doc__)
+    ap.add_argument("--mapping", required=True)
+    ap.add_argument("--pg-schema", default="public")
+    ap.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
+    ap.add_argument("--max-delete-fraction", type=float, default=0.10,
+                    help="skip a table if deletes exceed this fraction of its PG rows")
+    ap.add_argument("--force", action="store_true", help="ignore the fraction guard (empty-mirror guard still applies)")
+    add_lake_args(ap)
+    ap.add_argument("--include", nargs="*")
+    ap.add_argument("--json", action="store_true", help="emit a structured JSON prune report")
+    args = ap.parse_args(argv)
+
+    with open(args.mapping) as f:
+        mapping = json.load(f)
+    report = prune(mapping, dsn=dsn_from_env(), lake=lake_from_args(args), apply=args.apply,
+                   max_delete_fraction=args.max_delete_fraction, force=args.force,
+                   include=args.include, pg_schema=args.pg_schema)
+
     if args.json:
-        print(json.dumps({
-            "command": "prune",
-            "schema": args.pg_schema,
-            "applied": args.apply,
-            "rows_deleted": deleted_total if args.apply else None,
-            "tables_with_deletions": len(would),
-            "plans": [
-                {"table": p.table, "action": p.action, "mirror_rows": p.mirror_rows,
-                 "pg_rows": p.pg_rows, "would_delete": p.to_delete}
-                for p in plans if p.action != "nothing"
-            ],
-        }))
+        print(json.dumps(report))
     else:
         mode = "APPLIED" if args.apply else "DRY-RUN (use --apply to delete)"
         print(
-            f"Prune [{mode}] schema '{args.pg_schema}': "
-            f"{len(would)} table(s) with deletions"
-            + (f", {deleted_total} rows deleted" if args.apply else "")
+            f"Prune [{mode}] schema '{report['schema']}': "
+            f"{report['tables_with_deletions']} table(s) with deletions"
+            + (f", {report['rows_deleted']} rows deleted" if args.apply else "")
         )
-        for p in plans:
-            if p.action != "nothing":
-                print(f"  {p.action:18} {p.table}: mirror={p.mirror_rows} pg={p.pg_rows} would_delete={p.to_delete}")
+        for p in report["plans"]:
+            print(f"  {p['action']:18} {p['table']}: mirror={p['mirror_rows']} pg={p['pg_rows']} would_delete={p['would_delete']}")
     return 0
 
 

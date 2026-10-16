@@ -16,18 +16,21 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass
+from typing import Optional
 
-from mdb_ducklake.sync import open_lake
 from mdb_ducklake.to_postgres import (
-    _dsn,
+    LakeConfig,
     _mirror_columns,
+    add_lake_args,
+    dsn_from_env,
+    lake_from_args,
     mapped_projection,
+    mirror_and_postgres,
     q,
-    syncable,
+    selected_tables,
 )
 
 
@@ -85,72 +88,75 @@ def validate_table(con, pg_schema, pg_table, spec, src_types, deep):
     return Diff(pg_table, mirror_rows, pg_rows, only_in_mirror, only_in_pg, changed)
 
 
+def validate(mapping: dict, *, dsn: str, lake: LakeConfig, include: Optional[list] = None,
+             deep: bool = False, pg_schema: str = "public") -> dict:
+    """Compare the mirror with Postgres table by table. Writes nothing.
+
+    Returns the report the CLI prints with --json. `differences` lists only the
+    tables that differ. Without deep=True only row presence is compared, so an
+    empty list means no rows to add or prune; with deep=True it also means an
+    upsert would change no values. `changed` per table is None unless deep=True.
+    """
+    with mirror_and_postgres(lake, dsn, read_only=True) as con:
+        mirror_cols = _mirror_columns(con)
+        t0 = time.time()
+        diffs, skipped = [], []
+        for pg_table, spec in selected_tables(mapping, include):
+            if spec["access_table"] not in mirror_cols:
+                skipped.append(pg_table)
+                continue
+            diffs.append(validate_table(con, pg_schema, pg_table, spec, mirror_cols[spec["access_table"]], deep))
+        secs = time.time() - t0
+
+    dirty = [d for d in diffs if not d.clean]
+    return {
+        "command": "validate",
+        "schema": pg_schema,
+        "secs": round(secs, 1),
+        "deep": deep,
+        "tables_checked": len(diffs),
+        "clean": len(diffs) - len(dirty),
+        "differences": [
+            {"table": d.table, "mirror_rows": d.mirror_rows, "pg_rows": d.pg_rows,
+             "only_in_mirror": d.only_in_mirror, "only_in_pg": d.only_in_pg, "changed": d.changed}
+            for d in dirty
+        ],
+        "skipped": skipped,
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="mdb-ducklake-validate", description=__doc__)
     ap.add_argument("--mapping", required=True)
     ap.add_argument("--pg-schema", default="public")
     ap.add_argument("--deep", action="store_true", help="also count changed rows (slower; includes expected semantic diffs)")
-    ap.add_argument("--catalog", default=os.environ.get("DUCKLAKE_CATALOG", "s3://ducklake/pnds/catalog.ducklake"))
-    ap.add_argument("--data-path", default=os.environ.get("DUCKLAKE_DATA", "s3://ducklake/pnds/data"))
-    ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
-    ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
+    add_lake_args(ap)
     ap.add_argument("--include", nargs="*")
     ap.add_argument("--json", action="store_true", help="emit a structured JSON reconcile report")
     args = ap.parse_args(argv)
 
-    mapping = json.load(open(args.mapping))
-    lake = open_lake(args.catalog, args.data_path, s3_endpoint=args.s3_endpoint, s3_region=args.s3_region)
-    con = lake.con
-    con.execute("SET enable_progress_bar=false")
-    con.execute("INSTALL postgres")
-    con.execute("LOAD postgres")
-    con.execute(f"ATTACH '{_dsn()}' AS pg (TYPE postgres, READ_ONLY)")
-    mirror_cols = _mirror_columns(con)
+    with open(args.mapping) as f:
+        mapping = json.load(f)
+    report = validate(mapping, dsn=dsn_from_env(), lake=lake_from_args(args),
+                      include=args.include, deep=args.deep, pg_schema=args.pg_schema)
 
-    tables = [(t, s) for t, s in syncable(mapping)]
-    if args.include:
-        want = set(args.include)
-        tables = [(t, s) for t, s in tables if t in want]
-
-    t0 = time.time()
-    diffs, skipped = [], []
-    for pg_table, spec in tables:
-        if spec["access_table"] not in mirror_cols:
-            skipped.append(pg_table)
-            continue
-        diffs.append(validate_table(con, args.pg_schema, pg_table, spec, mirror_cols[spec["access_table"]], args.deep))
-    secs = time.time() - t0
-
-    dirty = [d for d in diffs if not d.clean]
     if args.json:
-        print(json.dumps({
-            "command": "validate",
-            "schema": args.pg_schema,
-            "secs": round(secs, 1),
-            "deep": args.deep,
-            "tables_checked": len(diffs),
-            "clean": len(diffs) - len(dirty),
-            "differences": [
-                {"table": d.table, "mirror_rows": d.mirror_rows, "pg_rows": d.pg_rows,
-                 "only_in_mirror": d.only_in_mirror, "only_in_pg": d.only_in_pg, "changed": d.changed}
-                for d in dirty
-            ],
-            "skipped": skipped,
-        }))
+        print(json.dumps(report))
     else:
         print(
-            f"Validated {len(diffs)} tables vs schema '{args.pg_schema}' in {secs:.1f}s: "
-            f"{len(diffs) - len(dirty)} clean, {len(dirty)} with differences, {len(skipped)} skipped."
+            f"Validated {report['tables_checked']} tables vs schema '{report['schema']}' in {report['secs']:.1f}s: "
+            f"{report['clean']} clean, {len(report['differences'])} with differences, "
+            f"{len(report['skipped'])} skipped."
         )
-        for d in dirty:
-            chg = "" if d.changed is None else f" changed={d.changed}"
+        for d in report["differences"]:
+            chg = "" if d["changed"] is None else f" changed={d['changed']}"
             print(
-                f"  DIFF {d.table}: mirror={d.mirror_rows} pg={d.pg_rows} "
-                f"only_in_mirror={d.only_in_mirror} only_in_pg={d.only_in_pg}{chg}"
+                f"  DIFF {d['table']}: mirror={d['mirror_rows']} pg={d['pg_rows']} "
+                f"only_in_mirror={d['only_in_mirror']} only_in_pg={d['only_in_pg']}{chg}"
             )
-        for t in skipped:
+        for t in report["skipped"]:
             print(f"  SKIP {t}: not in mirror")
-    return 1 if dirty else 0
+    return 1 if report["differences"] else 0
 
 
 if __name__ == "__main__":

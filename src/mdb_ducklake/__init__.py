@@ -1,3 +1,4 @@
+from mdb_ducklake.prune_postgres import prune
 from mdb_ducklake.sync import (
     Lake,
     TableResult,
@@ -7,6 +8,8 @@ from mdb_ducklake.sync import (
     sync_access_database,
     sync_csv,
 )
+from mdb_ducklake.to_postgres import LakeConfig, upsert
+from mdb_ducklake.validate_postgres import validate
 
 __all__ = [
     "Lake",
@@ -16,4 +19,9 @@ __all__ = [
     "load_full",
     "sync_csv",
     "sync_access_database",
+    # Mirror -> Postgres
+    "LakeConfig",
+    "validate",
+    "upsert",
+    "prune",
 ]

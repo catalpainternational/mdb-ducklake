@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -49,6 +49,8 @@ class Lake:
     catalog_uri: Optional[str] = None
     s3_endpoint: Optional[str] = None
     s3_region: Optional[str] = None
+    s3_key_id: Optional[str] = field(default=None, repr=False)
+    s3_secret: Optional[str] = field(default=None, repr=False)
 
     def push_catalog(self) -> None:
         """Flush and upload the catalog back to S3 (no-op for a local catalog).
@@ -62,7 +64,10 @@ class Lake:
         from mdb_ducklake import s3store
 
         self.con.execute(f"DETACH {self.alias}")
-        s3store.upload(self.catalog_path, self.catalog_uri, self.s3_endpoint, self.s3_region)
+        s3store.upload(
+            self.catalog_path, self.catalog_uri, self.s3_endpoint, self.s3_region,
+            self.s3_key_id, self.s3_secret,
+        )
 
     def snapshots(self) -> list[tuple]:
         return self.con.execute(
@@ -87,13 +92,16 @@ def open_lake(
     s3_endpoint: Optional[str] = None,
     s3_region: Optional[str] = None,
     s3_url_style: str = "vhost",
+    s3_key_id: Optional[str] = None,
+    s3_secret: Optional[str] = None,
 ) -> Lake:
     """Attach (creating if needed) a DuckLake and return a :class:`Lake`.
 
     ``catalog_path`` is a DuckDB file (checked into the repo). ``data_path`` is
     a directory for local prototyping or an ``s3://`` prefix in production. For
-    an ``s3://`` path, credentials are read from the environment (see
-    :data:`S3_KEY_ENV` / :data:`S3_SECRET_ENV`) and ``s3_endpoint``/``s3_region``
+    an ``s3://`` path, credentials are ``s3_key_id``/``s3_secret`` when both are
+    given, else read from the environment (see :data:`S3_KEY_ENV` /
+    :data:`S3_SECRET_ENV`), and ``s3_endpoint``/``s3_region``
     identify the S3-compatible provider (e.g. DigitalOcean Spaces).
     """
     from mdb_ducklake import s3store
@@ -108,6 +116,10 @@ def open_lake(
         Path(data_path).mkdir(parents=True, exist_ok=True)
         data_str = str(Path(data_path).resolve()) + "/"
 
+    if not (s3_key_id and s3_secret):
+        # One pair for every S3 client (DuckDB and boto3), never half from each.
+        s3_key_id, s3_secret = _first_env(S3_KEY_ENV), _first_env(S3_SECRET_ENV)
+
     # The catalog is either a local file or an S3 object mirrored to a local
     # temp file (S3 is the source of truth; we download it before use).
     catalog_uri: Optional[str] = None
@@ -115,7 +127,7 @@ def open_lake(
     if s3store.is_s3_uri(catalog_str):
         catalog_uri = catalog_str
         local = Path(tempfile.gettempdir()) / f"ducklake_{Path(s3store.parse_s3_uri(catalog_str)[1]).name}"
-        s3store.download(catalog_uri, local, s3_endpoint, s3_region)  # False if new -> fresh catalog
+        s3store.download(catalog_uri, local, s3_endpoint, s3_region, s3_key_id, s3_secret)  # False if new -> fresh catalog
         catalog_path = local
     else:
         catalog_path = Path(catalog_path)
@@ -125,7 +137,7 @@ def open_lake(
     con.execute("INSTALL ducklake")
     con.execute("LOAD ducklake")
     if data_is_s3 or catalog_uri:
-        _configure_s3(con, s3_endpoint, s3_region, s3_url_style)
+        _configure_s3(con, s3_endpoint, s3_region, s3_url_style, s3_key_id, s3_secret)
     con.execute(
         f"ATTACH IF NOT EXISTS 'ducklake:{catalog_path}' AS {alias} "
         f"(DATA_PATH '{data_str}')"
@@ -138,6 +150,8 @@ def open_lake(
         catalog_uri=catalog_uri,
         s3_endpoint=s3_endpoint,
         s3_region=s3_region,
+        s3_key_id=s3_key_id,
+        s3_secret=s3_secret,
     )
 
 
@@ -150,19 +164,21 @@ def _configure_s3(
     endpoint: Optional[str],
     region: Optional[str],
     url_style: str,
+    key_id: Optional[str] = None,
+    secret: Optional[str] = None,
     secret_name: str = "mdb_ducklake_s3",
 ) -> None:
-    """Register a DuckDB S3 secret from environment credentials.
+    """Register a DuckDB S3 secret from the given credentials, else the environment.
 
     The secret value is only ever inlined into the CREATE SECRET statement,
     which is never logged; on failure we raise a scrubbed error so the key
     cannot leak through an exception message.
     """
-    key_id = _first_env(S3_KEY_ENV)
-    secret = _first_env(S3_SECRET_ENV)
+    key_id = key_id or _first_env(S3_KEY_ENV)
+    secret = secret or _first_env(S3_SECRET_ENV)
     if not key_id or not secret:
         raise RuntimeError(
-            "s3:// DATA_PATH needs credentials in the environment "
+            "s3:// DATA_PATH needs credentials, passed in or in the environment "
             f"(one of {S3_KEY_ENV} and {S3_SECRET_ENV}). "
             "Inject them at runtime, e.g. `sops exec-env s3.enc.env <command>`."
         )
