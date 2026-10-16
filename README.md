@@ -11,7 +11,8 @@ hundred lines of Python. (For the story, see
 
 Extraction shells out to the [mdbtools](https://github.com/mdbtools/mdbtools)
 CLI; everything after that is DuckDB. Dependencies: `duckdb`, `pytz`, `boto3`,
-`psycopg2` — no pydantic.
+plus `psycopg2` for the Postgres sync (`pip install mdb-ducklake[postgres]`, or
+bring your own) — no pydantic.
 
 ## Two halves
 
@@ -30,6 +31,23 @@ mapping artifact:
 | `mdb-ducklake-prune` | guarded delete of rows gone from the mirror | dry-run default |
 
 All three take `--json` for a structured run report; exit codes signal drift.
+
+The same three are importable, taking the connection details as arguments rather
+than environment variables; each returns the dict its CLI prints with `--json`:
+
+```python
+from mdb_ducklake import LakeConfig, prune, upsert, validate
+
+lake = LakeConfig(
+    catalog="s3://bucket/pnds/catalog.ducklake", data_path="s3://bucket/pnds/data",
+    s3_endpoint="sgp1.digitaloceanspaces.com", s3_region="sgp1",
+    s3_key_id=..., s3_secret=...,
+)
+dsn = "host=localhost dbname=app user=app password=..."
+report = validate(mapping, dsn=dsn, lake=lake)          # report["differences"] == [] when clean
+upsert(mapping, dsn=dsn, lake=lake)                     # ["rows_written"], ["mismatches"]
+prune(mapping, dsn=dsn, lake=lake, apply=False)         # dry run; ["plans"] lists tables with rows to delete
+```
 
 ## Quick start
 
