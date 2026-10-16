@@ -18,7 +18,7 @@ dependencies = [
 [project.scripts]
 mdb-ducklake = "mdb_ducklake.cli:main"
 # Postgres sync (Option B): mirror -> partisipa Postgres.
-mdb-ducklake-validate = "mdb_ducklake.validate:main"       # read-only reconcile
+mdb-ducklake-validate = "mdb_ducklake.validate_postgres:main"       # read-only reconcile
 mdb-ducklake-to-postgres = "mdb_ducklake.to_postgres:main"  # upsert
 mdb-ducklake-prune = "mdb_ducklake.prune_postgres:main"     # guarded delete
 
