@@ -136,6 +136,6 @@ pre-production checklist.
 | `access.py` | stdlib mdbtools CLI wrapper (list/export/schema) |
 | `s3store.py` | boto3 catalog download/upload |
 | `to_postgres.py` | mapping, `mapped_projection`, staging + upsert, `load_order` |
-| `validate.py` | read-only mirror↔Postgres reconcile |
+| `validate_postgres.py` | read-only mirror↔Postgres reconcile |
 | `prune_postgres.py` | guarded delete of rows gone from the mirror |
 | `cli.py` | the `mdb-ducklake` mirror CLI (sync/sync-csv/info) |
