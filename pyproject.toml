@@ -1,9 +1,11 @@
 [project]
 name = "mdb-ducklake"
-version = "0.0.1"
+version = "0.1.0"
 description = "Sync an MS Access database into an updatable DuckLake mirror"
 authors = [{ name = "Josh Brooks", email = "josh@catalpa.io" }]
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = [
     "duckdb>=1.3.0",
@@ -15,6 +17,14 @@ dependencies = [
 # which must be installed on the system (e.g. `brew install mdbtools`). There
 # is deliberately no Python dependency for it — see src/mdb_ducklake/access.py.
 
+[project.urls]
+Repository = "https://github.com/catalpainternational/mdb-ducklake"
+
+[project.optional-dependencies]
+# The Postgres sync (validate/upsert/prune) needs a psycopg2 driver. Skip this
+# extra if you already have one (psycopg2 or psycopg2-binary both work).
+postgres = ["psycopg2-binary>=2.9"]
+
 [project.scripts]
 mdb-ducklake = "mdb_ducklake.cli:main"
 # Postgres sync (Option B): mirror -> partisipa Postgres.
@@ -22,9 +32,13 @@ mdb-ducklake-validate = "mdb_ducklake.validate_postgres:main"       # read-only 
 mdb-ducklake-to-postgres = "mdb_ducklake.to_postgres:main"  # upsert
 mdb-ducklake-prune = "mdb_ducklake.prune_postgres:main"     # guarded delete
 
+[tool.hatch.build.targets.sdist]
+# Keep the encrypted credentials, SOPS config and spike artifacts out of the sdist.
+exclude = ["s3.enc.env", ".sops.yaml", "spikes/", "uv.lock"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = ["pytest>=8", "psycopg2-binary>=2.9"]  # psycopg2 is for the Postgres-upsert spike
+dev = ["pytest>=8", "psycopg2-binary>=2.9"]  # psycopg2 for the Postgres integration tests
