@@ -94,3 +94,79 @@ def test_syncable_skips_views():
     }
     got = {t for t, _ in syncable(mapping)}
     assert got == {"real_tbl"}
+
+
+def test_s3_credentials_passed_in_need_no_environment(monkeypatch):
+    import duckdb
+
+    from mdb_ducklake.sync import S3_KEY_ENV, S3_SECRET_ENV, _configure_s3
+
+    for name in S3_KEY_ENV + S3_SECRET_ENV:
+        monkeypatch.delenv(name, raising=False)
+    con = duckdb.connect()
+    _configure_s3(con, "sgp1.digitaloceanspaces.com", "sgp1", "vhost", "KEY123", "SECRET456")
+    (secret_string,) = con.execute(
+        "SELECT secret_string FROM duckdb_secrets() WHERE name = 'mdb_ducklake_s3'"
+    ).fetchone()
+    assert "key_id=KEY123" in secret_string
+
+
+def test_unreachable_postgres_error_hides_password(tmp_path):
+    import pytest
+
+    from mdb_ducklake import LakeConfig, validate
+
+    lake = LakeConfig(str(tmp_path / "c.ducklake"), str(tmp_path / "data"))
+    dsn = "host=localhost port=1 dbname=x user=u password=REALPW77 connect_timeout=2"
+    with pytest.raises(Exception) as caught:
+        validate({"tables": {}}, dsn=dsn, lake=lake)
+    exc = caught.value
+    while exc is not None:  # nothing in the chain may still carry it
+        assert "REALPW77" not in str(exc)
+        exc = exc.__cause__ or exc.__context__
+
+
+def test_without_dsn_redacts_key_value_and_uri_passwords():
+    from mdb_ducklake.to_postgres import without_dsn
+
+    msg = without_dsn(
+        r"at 'host=h password='it\'s secret' user=u' and postgresql://u:hunter2@h/db", "unused"
+    )
+    assert "secret" not in msg and "hunter2" not in msg
+    assert "postgresql://u:***@h/db" in msg
+
+
+def test_open_lake_hands_passed_credentials_to_s3_setup(tmp_path, monkeypatch):
+    import pytest
+
+    from mdb_ducklake import sync
+
+    seen = {}
+
+    def fake_configure(con, endpoint, region, url_style, key_id=None, secret=None):
+        seen.update(key_id=key_id, secret=secret)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(sync, "_configure_s3", fake_configure)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ENVKEY")
+    with pytest.raises(RuntimeError, match="stop here"):
+        sync.open_lake(tmp_path / "c.ducklake", "s3://bucket/data", s3_key_id="KEY1", s3_secret="SEC1")
+    assert seen == {"key_id": "KEY1", "secret": "SEC1"}
+
+
+def test_lake_config_credentials_reach_open_lake(monkeypatch):
+    import pytest
+
+    from mdb_ducklake import LakeConfig, to_postgres
+
+    seen = {}
+
+    def fake_open_lake(catalog, data_path, **kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(to_postgres, "open_lake", fake_open_lake)
+    lake = LakeConfig("s3://b/c.ducklake", "s3://b/data", s3_key_id="KEY2", s3_secret="SEC2")
+    with pytest.raises(RuntimeError, match="stop here"):
+        to_postgres.upsert({"tables": {}}, dsn="x", lake=lake)
+    assert (seen["s3_key_id"], seen["s3_secret"]) == ("KEY2", "SEC2")

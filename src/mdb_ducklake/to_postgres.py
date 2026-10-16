@@ -22,14 +22,111 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Optional
 
-from mdb_ducklake.sync import open_lake
+import duckdb
+
+from mdb_ducklake.sync import _sql_str, open_lake
 
 STAGING_SCHEMA = "mdb_stg"
 
 
-def _dsn() -> str:
+@dataclass
+class LakeConfig:
+    """Where the DuckLake mirror lives and how to reach it.
+
+    Pass both S3 credentials, or neither to read them from the environment
+    (see mdb_ducklake.sync.S3_KEY_ENV / S3_SECRET_ENV).
+    """
+
+    catalog: str
+    data_path: str
+    s3_endpoint: Optional[str] = None
+    s3_region: Optional[str] = None
+    s3_key_id: Optional[str] = field(default=None, repr=False)
+    s3_secret: Optional[str] = field(default=None, repr=False)
+
+
+def add_lake_args(ap: argparse.ArgumentParser) -> None:
+    """The --catalog/--data-path/--s3-* options shared by the Postgres CLIs."""
+    ap.add_argument("--catalog", default=os.environ.get("DUCKLAKE_CATALOG", "s3://ducklake/pnds/catalog.ducklake"))
+    ap.add_argument("--data-path", default=os.environ.get("DUCKLAKE_DATA", "s3://ducklake/pnds/data"))
+    ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
+    ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
+
+
+def lake_from_args(args) -> LakeConfig:
+    """A LakeConfig from CLI options; S3 credentials come from the environment."""
+    return LakeConfig(args.catalog, args.data_path, args.s3_endpoint, args.s3_region)
+
+
+@contextmanager
+def mirror_and_postgres(lake: LakeConfig, dsn: str, *, read_only: bool, staging: bool = False):
+    """A DuckDB connection with the mirror attached as `lake` and Postgres as `pg`.
+
+    With staging=True, the mdb_stg schema is created first and dropped on the
+    way out. The connection is always closed, and DuckDB errors are re-raised
+    with the DSN and any password removed, because DuckDB quotes the whole
+    connection string when it cannot reach Postgres. (The DSN still sits in
+    the callers' local variables, which some error trackers record.)
+    """
+    try:
+        con = open_lake(
+            lake.catalog, lake.data_path,
+            s3_endpoint=lake.s3_endpoint, s3_region=lake.s3_region,
+            s3_key_id=lake.s3_key_id, s3_secret=lake.s3_secret,
+        ).con
+        try:
+            con.execute("SET enable_progress_bar=false")  # keep stdout clean for the report
+            con.execute("INSTALL postgres")
+            con.execute("LOAD postgres")
+            opts = "TYPE postgres, READ_ONLY" if read_only else "TYPE postgres"
+            con.execute(f"ATTACH {_sql_str(dsn)} AS pg ({opts})")
+            if staging:
+                con.execute(f"CREATE SCHEMA IF NOT EXISTS pg.{q(STAGING_SCHEMA)}")
+            try:
+                yield con
+            except BaseException:
+                if staging:
+                    # Best effort: never let a failed cleanup replace the real error.
+                    try:
+                        con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
+                    except duckdb.Error:
+                        pass
+                raise
+            if staging:
+                con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
+        finally:
+            con.close()
+    except duckdb.Error as exc:
+        # Scrub in place and re-raise the same object: no unscrubbed copy is
+        # left behind in __context__ for a logger or error tracker to find.
+        exc.args = (without_dsn(str(exc), dsn),)
+        raise
+
+
+_PASSWORD = re.compile(r"(password\s*=\s*)('(?:[^'\\]|\\.)*'|\S+)|(://[^:/@\s]*:)[^@\s]*@", re.I)
+
+
+def without_dsn(msg: str, dsn: str) -> str:
+    """`msg` with the DSN and any password in it replaced."""
+    msg = msg.replace(dsn, "<dsn>")
+    return _PASSWORD.sub(lambda m: f"{m.group(1)}***" if m.group(1) else f"{m.group(3)}***@", msg)
+
+
+def selected_tables(mapping, include):
+    """syncable() narrowed to `include` (all tables when include is None)."""
+    tables = list(syncable(mapping))
+    if include is not None:
+        want = set(include)
+        tables = [(t, s) for t, s in tables if t in want]
+    return tables
+
+
+def dsn_from_env() -> str:
+    """The CLIs' Postgres connection string, from the PG* environment variables."""
     parts = dict(
         host=os.environ.get("PGHOST", "localhost"),
         port=os.environ.get("PGPORT", "5432"),
@@ -192,44 +289,32 @@ def upsert_sql(pg_schema, pg_table, pk_col, cols):
     return sql
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="mdb-ducklake-to-postgres", description=__doc__)
-    ap.add_argument("--mapping", required=True, help="ducklake_pg_mapping.json")
-    ap.add_argument("--pg-schema", default="public", help="target Postgres schema")
-    ap.add_argument("--catalog", default=os.environ.get("DUCKLAKE_CATALOG", "s3://ducklake/pnds/catalog.ducklake"))
-    ap.add_argument("--data-path", default=os.environ.get("DUCKLAKE_DATA", "s3://ducklake/pnds/data"))
-    ap.add_argument("--s3-endpoint", default=os.environ.get("S3_ENDPOINT", "sgp1.digitaloceanspaces.com"))
-    ap.add_argument("--s3-region", default=os.environ.get("S3_REGION", "sgp1"))
-    ap.add_argument("--include", nargs="*", help="only these pg tables")
-    ap.add_argument("--json", action="store_true", help="emit a structured JSON run report")
-    args = ap.parse_args(argv)
+def upsert(mapping: dict, *, dsn: str, lake: LakeConfig, include: Optional[list] = None,
+           pg_schema: str = "public") -> dict:
+    """Insert or update every mapped Postgres table from the mirror. Never deletes.
 
+    Returns the report the CLI prints with --json. `rows_written` counts rows
+    inserted or actually changed; `mismatches` lists tables where Postgres has
+    fewer rows than the mirror after the run (empty means all good).
+    """
     import psycopg2
 
-    mapping = json.load(open(args.mapping))
-    lake = open_lake(args.catalog, args.data_path, s3_endpoint=args.s3_endpoint, s3_region=args.s3_region)
-    con = lake.con
-    con.execute("SET enable_progress_bar=false")  # keep stdout clean for the report
-    con.execute("INSTALL postgres")
-    con.execute("LOAD postgres")
-    con.execute(f"ATTACH '{_dsn()}' AS pg (TYPE postgres)")
-    con.execute(f"CREATE SCHEMA IF NOT EXISTS pg.{q(STAGING_SCHEMA)}")
-    mirror_cols = _mirror_columns(con)
+    with mirror_and_postgres(lake, dsn, read_only=False, staging=True) as con:
+        return _upsert(con, mapping, dsn, include, pg_schema, psycopg2)
 
-    tables = [(t, s) for t, s in syncable(mapping)]
-    if args.include:
-        want = set(args.include)
-        tables = [(t, s) for t, s in tables if t in want]
+
+def _upsert(con, mapping, dsn, include, pg_schema, psycopg2) -> dict:
+    mirror_cols = _mirror_columns(con)
 
     # --- Phase A: DuckDB streams mirror -> Postgres staging (order-independent) ---
     staged = []  # (pg_table, spec, pairs)
     skipped = []
     t0 = time.time()
-    for pg_table, spec in tables:
+    for pg_table, spec in selected_tables(mapping, include):
         if spec["access_table"] not in mirror_cols:
             skipped.append((pg_table, f"no mirror table {spec['access_table']!r}"))
             continue
-        pairs = stage_table(con, args.pg_schema, pg_table, spec, mirror_cols)
+        pairs = stage_table(con, pg_schema, pg_table, spec, mirror_cols)
         staged.append((pg_table, spec, pairs))
     stage_secs = time.time() - t0
 
@@ -240,7 +325,7 @@ def main(argv=None) -> int:
     # refresh triggers) beforehand and recreates/refreshes them after, so no
     # trigger fires during the bulk load. See docs/postgres-sync-handoff.md.
     t1 = time.time()
-    pgconn = psycopg2.connect(_dsn())
+    pgconn = psycopg2.connect(dsn)
     rows_written = 0
     try:
         with pgconn:
@@ -248,49 +333,65 @@ def main(argv=None) -> int:
                 cur.execute("SET CONSTRAINTS ALL DEFERRED")
                 for pg_table, spec, pairs in staged:
                     cols = [c for c, _ in pairs]
-                    cur.execute(upsert_sql(args.pg_schema, pg_table, spec["pk_pg_col"], cols))
+                    cur.execute(upsert_sql(pg_schema, pg_table, spec["pk_pg_col"], cols))
                     rows_written += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     finally:
         pgconn.close()
     upsert_secs = time.time() - t1
-    load_mode = "FK-enforced (deferred to commit)"
 
-    # --- report + verify counts, then drop staging ---
+    # --- verify counts ---
     results = []
     for pg_table, spec, pairs in staged:
         src = con.execute(f'SELECT count(*) FROM lake.{q(spec["access_table"])}').fetchone()[0]
-        tgt = con.execute(f"SELECT count(*) FROM pg.{q(args.pg_schema)}.{q(pg_table)}").fetchone()[0]
+        tgt = con.execute(f"SELECT count(*) FROM pg.{q(pg_schema)}.{q(pg_table)}").fetchone()[0]
         results.append(TableResult(pg_table, src, tgt, len(pairs), ok=(src <= tgt)))
-    con.execute(f"DROP SCHEMA IF EXISTS pg.{q(STAGING_SCHEMA)} CASCADE")
 
-    bad = [r for r in results if not r.ok]
+    return {
+        "command": "to_postgres",
+        "schema": pg_schema,
+        "stage_secs": round(stage_secs, 1),
+        "upsert_secs": round(upsert_secs, 1),
+        "rows_written": rows_written,
+        "load_mode": "FK-enforced (deferred to commit)",
+        "tables_synced": len(results),
+        "tables": [
+            {"table": r.table, "mirror_rows": r.source_rows, "pg_rows": r.target_rows,
+             "cols": r.mapped_cols, "ok": r.ok} for r in results
+        ],
+        "skipped": [{"table": t, "reason": why} for t, why in skipped],
+        "mismatches": [r.table for r in results if not r.ok],
+    }
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="mdb-ducklake-to-postgres", description=__doc__)
+    ap.add_argument("--mapping", required=True, help="ducklake_pg_mapping.json")
+    ap.add_argument("--pg-schema", default="public", help="target Postgres schema")
+    add_lake_args(ap)
+    ap.add_argument("--include", nargs="*", help="only these pg tables")
+    ap.add_argument("--json", action="store_true", help="emit a structured JSON run report")
+    args = ap.parse_args(argv)
+
+    with open(args.mapping) as f:
+        mapping = json.load(f)
+    report = upsert(mapping, dsn=dsn_from_env(), lake=lake_from_args(args),
+                    include=args.include, pg_schema=args.pg_schema)
+
     if args.json:
-        print(json.dumps({
-            "command": "to_postgres",
-            "schema": args.pg_schema,
-            "stage_secs": round(stage_secs, 1),
-            "upsert_secs": round(upsert_secs, 1),
-            "rows_written": rows_written,
-            "load_mode": load_mode,
-            "tables_synced": len(results),
-            "tables": [
-                {"table": r.table, "mirror_rows": r.source_rows, "pg_rows": r.target_rows,
-                 "cols": r.mapped_cols, "ok": r.ok} for r in results
-            ],
-            "skipped": [{"table": t, "reason": why} for t, why in skipped],
-            "mismatches": [r.table for r in bad],
-        }))
+        print(json.dumps(report))
     else:
         print(
-            f"Upserted {len(results)} tables into schema '{args.pg_schema}' "
-            f"(stage {stage_secs:.1f}s, upsert {upsert_secs:.1f}s; load mode: {load_mode}). "
-            f"rows_written={rows_written} skipped={len(skipped)} mismatches={len(bad)}"
+            f"Upserted {report['tables_synced']} tables into schema '{report['schema']}' "
+            f"(stage {report['stage_secs']:.1f}s, upsert {report['upsert_secs']:.1f}s; "
+            f"load mode: {report['load_mode']}). rows_written={report['rows_written']} "
+            f"skipped={len(report['skipped'])} mismatches={len(report['mismatches'])}"
         )
-        for pg_table, why in skipped:
-            print(f"  SKIP  {pg_table}: {why}")
-        for r in bad:
-            print(f"  CHECK {r.table}: mirror={r.source_rows} pg>={r.target_rows} cols={r.mapped_cols}")
-    return 1 if bad else 0
+        for s in report["skipped"]:
+            print(f"  SKIP  {s['table']}: {s['reason']}")
+        for t in report["tables"]:
+            if not t["ok"]:
+                print(f"  CHECK {t['table']}: mirror={t['mirror_rows']} pg>={t['pg_rows']} cols={t['cols']}")
+    return 1 if report["mismatches"] else 0
 
 
 if __name__ == "__main__":

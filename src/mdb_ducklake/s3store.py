@@ -26,7 +26,7 @@ def parse_s3_uri(uri: str) -> Tuple[str, str]:
     return bucket, key
 
 
-def _client(endpoint: str | None, region: str | None):
+def _client(endpoint: str | None, region: str | None, key_id: str | None = None, secret: str | None = None):
     try:
         import boto3
     except ImportError as exc:  # pragma: no cover
@@ -39,16 +39,22 @@ def _client(endpoint: str | None, region: str | None):
         kwargs["endpoint_url"] = f"https://{endpoint}"
     if region:
         kwargs["region_name"] = region
-    # Access key/secret are read from the environment by boto3.
+    if key_id and secret:
+        kwargs["aws_access_key_id"] = key_id
+        kwargs["aws_secret_access_key"] = secret
+    # Otherwise boto3 reads the access key/secret from the environment.
     return boto3.client("s3", **kwargs)
 
 
-def download(uri: str, dest: str | Path, endpoint: str | None, region: str | None) -> bool:
+def download(
+    uri: str, dest: str | Path, endpoint: str | None, region: str | None,
+    key_id: str | None = None, secret: str | None = None,
+) -> bool:
     """Download s3 object to dest. Returns False if the object doesn't exist."""
     from botocore.exceptions import ClientError
 
     bucket, key = parse_s3_uri(uri)
-    client = _client(endpoint, region)
+    client = _client(endpoint, region, key_id, secret)
     try:
         client.download_file(bucket, key, str(dest))
         return True
@@ -59,6 +65,9 @@ def download(uri: str, dest: str | Path, endpoint: str | None, region: str | Non
         raise
 
 
-def upload(src: str | Path, uri: str, endpoint: str | None, region: str | None) -> None:
+def upload(
+    src: str | Path, uri: str, endpoint: str | None, region: str | None,
+    key_id: str | None = None, secret: str | None = None,
+) -> None:
     bucket, key = parse_s3_uri(uri)
-    _client(endpoint, region).upload_file(str(src), bucket, key)
+    _client(endpoint, region, key_id, secret).upload_file(str(src), bucket, key)
